@@ -1,7 +1,5 @@
 # 🚀 C-Transformers: Cache-Optimized Transformers in C
 
-Building Embedded AI from Scratch — in C, on CPUs, for Real-Time Autonomy.
-
 This project is a pure C implementation of a GPT-style transformer model with:
 - 🧠 Fully contiguous, single-block memory layout
 - 📏 64-byte alignment for every tensor
