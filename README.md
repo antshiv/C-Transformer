@@ -37,7 +37,7 @@ This repo tracks my video series on building high-performance embedded AI system
 
 ```bash
 # Dry run (estimate memory usage only)
-./main_v2 --layers 12 --dmodel 384 --ctx 256 --vocab 32768
+./main --layers 12 --dmodel 384 --ctx 256 --vocab 32768
 
 # Force allocation with hugepages
-./main_v2 --layers 12 --dmodel 384 --ctx 256 --vocab 32768 --force
+./main --layers 12 --dmodel 384 --ctx 256 --vocab 32768 --force
