@@ -1,24 +1,35 @@
-# 🧠 C-Transformer: Pure C Transformer with HPC Layout
+# 🚀 C-Transformers: Cache-Optimized Transformers in C
 
-A single-file, memory-efficient Transformer model written in C — optimized for CPU-based inference and training. Designed for clarity, performance, and educational value.
+Building Embedded AI from Scratch — in C, on CPUs, for Real-Time Autonomy.
 
----
-
-## 🚀 Why This Project?
-
-This project demonstrates how to build an AI system in C with:
-- Single-block memory allocation (huge pages, 64-byte cache lines)
-- Token-sliced execution across cores
-- Explicit, human-readable memory layout
-- Forward and backward pass in a clean architecture
+This project is a pure C implementation of a GPT-style transformer model with:
+- 🧠 Fully contiguous, single-block memory layout
+- 📏 64-byte alignment for every tensor
+- 🧱 Hugepage-backed allocations (2MB) to minimize TLB misses
+- ⚙️ Inline memory bump allocator to track offsets precisely
+- 🔧 Dry-run and allocation modes for profiling model memory capacity
 
 ---
 
-## 🧩 Core Concepts
+## 📺 YouTube Series
 
-- `layout_transformer()` — defines the memory layout
-- `bump()` — allocates offsets for all weights, activations, and embeddings
-- `get_slice()` / `get_head_slice()` — extract token/head-parallel tensor views
+This repo tracks my video series on building high-performance embedded AI systems.
+
+▶️ **Series Playlist**: [Antshiv Robotics YouTube](https://www.youtube.com/@AntshivRobotics)  
+🧵 Each video will have its own tagged release (`v1.0`, `v1.1`, etc.) that matches the code exactly.
+
+---
+
+## 🧠 Features
+
+- Optimized layout for GPT-2-style transformers
+- Clean C code with no external dependencies
+- Command-line options to configure model dimensions:
+  - `--layers`
+  - `--dmodel`
+  - `--ctx`
+  - `--vocab`
+- `--force` option to trigger actual memory allocation
 
 ---
 
@@ -29,6 +40,16 @@ git clone https://github.com/antshiv/C-Transformer
 cd C-Transformer
 chmod +x script.sh
 ./script.sh
+```
+
+## 🧪 Example
+
+```bash
+# Dry run (estimate memory usage only)
+./main --layers 12 --dmodel 384 --ctx 256 --vocab 32768
+
+# Force allocation with hugepages
+./main --layers 12 --dmodel 384 --ctx 256 --vocab 32768 --force
 ```
 
 ## 🔧 Usage Examples
@@ -48,15 +69,6 @@ for (size_t t = 0; t < token_count; ++t) {
     // Do work here...
 }
 ```
-
-## 📦 Version v0.2 Highlights
-
-This version includes:
-- Full transformer memory layout using `layout_transformer()`
-- Bump allocator with zero fragmentation
-- Aligned embedding rows for token-sliced, core-parallel access
-- Runtime-access helpers: `get_slice()`, `get_slice_and_len()`, and `get_head_slice()`
-
 
 ## 📺 Related Video
 
