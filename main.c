@@ -55,6 +55,12 @@ typedef struct {
 typedef struct {
     /* hyper-parameters */
     int num_layers, vocab_size, embed_dim, context_window;
+    size_t aligned_embed_dim;
+
+    /* execution plan */
+    int num_cores;                 // usable compute cores for model
+    int tokens_per_core;          // slice of context_window each core owns
+    int num_attention_heads;      // usually embed_dim / head_dim
 
     /* single block */
     float  *memory_base;
@@ -86,8 +92,12 @@ void layout_transformer(TransformerModel *M)
 {
     size_t off = 0;                                        /* cursor in floats */
 
+    /* Ensure each token embedding vector starts on a cache-aligned boundary */
+    size_t aligned_embed_dim = align_up(M->embed_dim, CACHE_ALIGN / sizeof(float));
+    M->aligned_embed_dim = aligned_embed_dim;
+
     /* embeddings */
-    M->token_emb_offset      = bump(&off, (size_t)M->vocab_size   * M->embed_dim, CACHE_ALIGN);
+    M->token_emb_offset      = bump(&off, (size_t)M->vocab_size * aligned_embed_dim, CACHE_ALIGN);
     M->pos_emb_offset        = bump(&off, (size_t)M->context_window * M->embed_dim, CACHE_ALIGN);
     M->embedded_input_offset = bump(&off, (size_t)M->context_window * M->embed_dim, CACHE_ALIGN);
 
@@ -181,6 +191,52 @@ static size_t bytes_needed(int layers, int vocab, int d_model, int ctx)
     return total_floats * sizeof(float);   /* bytes */
 }
 
+/***********************************************************************
+ *  SLICE HELPERS: Access aligned memory slices for core and head
+ *  ---------------------------------------------------------------
+ *  - get_slice()           → token-parallel access for core-local compute
+ *  - get_slice_and_len()   → same as get_slice + token count (loop bound)
+ *  - get_head_slice()      → head-parallel access inside attention layers
+ ***********************************************************************/
+
+/* Return pointer to core-local slice of vectorized data */
+static inline float *get_slice(TransformerModel *M, int core_id,
+                               size_t base_offset, size_t vector_dim)
+{
+    size_t token_start = core_id * M->tokens_per_core;
+    if (token_start >= M->context_window) return NULL;  // bounds-safe
+    return M->memory_base + base_offset + token_start * vector_dim;
+}
+
+/* Return pointer and number of tokens this core owns */
+static inline float *get_slice_and_len(TransformerModel *M, int core_id,
+                                       size_t base_offset, size_t vector_dim,
+                                       size_t *out_tokens)
+{
+    size_t t0 = core_id * M->tokens_per_core;
+    size_t t1 = (core_id + 1) * M->tokens_per_core;
+    if (t0 >= M->context_window) return NULL;
+    if (t1 > M->context_window) t1 = M->context_window;
+    *out_tokens = t1 - t0;
+    return M->memory_base + base_offset + t0 * vector_dim;
+}
+
+/* Return pointer to head-local slice for a token block */
+static inline float *get_head_slice(
+    TransformerModel *M,
+    size_t base_offset,
+    int head_id,
+    int total_heads,
+    int token_start,
+    int token_count)
+{
+    size_t head_dim = M->embed_dim / total_heads;
+    size_t offset = base_offset
+                  + token_start * total_heads * head_dim  // full rows
+                  + head_id * head_dim;                   // head offset
+    return M->memory_base + offset;
+}
+
 /* ---------------- main with --size-only / --force -------------------- */
 int main(int argc, char **argv)
 {
@@ -239,6 +295,24 @@ int main(int argc, char **argv)
     layout_transformer(&M);
     printf("✅ Success!  mmap at %p, %.2f GiB reserved.\n",
            (void*)M.memory_base, need_gib);
+
+
+    /* Setup execution plan */
+    long logical_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    int reserved_cores = 4;  // for OS, logging, etc.
+
+    M.num_cores = (logical_cores > reserved_cores)
+                  ? logical_cores - reserved_cores
+                  : 1;
+    M.tokens_per_core = (M.context_window + M.num_cores - 1) / M.num_cores;
+    M.num_attention_heads = M.embed_dim / 64;  // assume head_dim = 64
+
+    printf("🧠 Detected %ld logical cores → reserving %d for OS → using %d for model\n",
+           logical_cores, reserved_cores, M.num_cores);
+    printf("📦 Each core will handle ≈ %d tokens from context window of %d tokens\n",
+           M.tokens_per_core, M.context_window);
+    printf("🧠 Attention heads = %d (assuming head_dim=64)\n", M.num_attention_heads);
+
 
     destroy_transformer(&M);
     return 0;
