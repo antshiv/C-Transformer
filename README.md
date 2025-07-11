@@ -29,6 +29,7 @@ git clone https://github.com/antshiv/C-Transformer
 cd C-Transformer
 chmod +x script.sh
 ./script.sh
+```
 
 ## 🔧 Usage Examples
 
@@ -46,6 +47,7 @@ for (size_t t = 0; t < token_count; ++t) {
     float *vec = input + t * M->embed_dim;
     // Do work here...
 }
+```
 
 ## 📦 Version v0.2 Highlights
 
