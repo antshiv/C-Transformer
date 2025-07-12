@@ -90,18 +90,18 @@ static inline size_t bump(size_t *off, size_t count, size_t alignB)
 /* ─── lay out the entire model ───────────────────────────────────── */
 void layout_transformer(TransformerModel *M)
 {
-    size_t off = 0;                                        /* cursor in floats */
+    size_t off = 0;
 
-    /* Ensure each token embedding vector starts on a cache-aligned boundary */
+    // Ensure each token embedding vector is cache-aligned
     size_t aligned_embed_dim = align_up(M->embed_dim, CACHE_ALIGN / sizeof(float));
     M->aligned_embed_dim = aligned_embed_dim;
 
-    /* embeddings */
+    // Embeddings
     M->token_emb_offset      = bump(&off, (size_t)M->vocab_size * aligned_embed_dim, CACHE_ALIGN);
-    M->pos_emb_offset        = bump(&off, (size_t)M->context_window * M->embed_dim, CACHE_ALIGN);
-    M->embedded_input_offset = bump(&off, (size_t)M->context_window * M->embed_dim, CACHE_ALIGN);
+    M->pos_emb_offset        = bump(&off, (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
+    M->embedded_input_offset = bump(&off, (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
 
-    /* per-layer */
+    // Per-layer layout
     M->layers_start_offset = off;
     M->layers = malloc(sizeof(TrulyOptimalLayer) * M->num_layers);
     if (!M->layers) { perror("malloc layers"); exit(EXIT_FAILURE); }
@@ -109,45 +109,40 @@ void layout_transformer(TransformerModel *M)
     for (int l = 0; l < M->num_layers; ++l) {
         TrulyOptimalLayer *L = &M->layers[l];
 
-        L->ln1_weight_offset  = bump(&off, M->embed_dim, CACHE_ALIGN);
-        L->ln1_bias_offset    = bump(&off, M->embed_dim, CACHE_ALIGN);
+        L->ln1_weight_offset  = bump(&off, aligned_embed_dim, CACHE_ALIGN);
+        L->ln1_bias_offset    = bump(&off, aligned_embed_dim, CACHE_ALIGN);
 
-        L->layer_input_offset = bump(&off, (size_t)M->context_window * M->embed_dim, CACHE_ALIGN);
-        L->ln1_output_offset  = bump(&off, (size_t)M->context_window * M->embed_dim, CACHE_ALIGN);
+        L->layer_input_offset = bump(&off, (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
+        L->ln1_output_offset  = bump(&off, (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
 
-        L->qkv_weight_offset  = bump(&off, 3ULL * M->embed_dim * M->embed_dim, CACHE_ALIGN);
-        L->qkv_bias_offset    = bump(&off, 3ULL * M->embed_dim, CACHE_ALIGN);
-        L->qkv_output_offset  = bump(&off, 3ULL * (size_t)M->context_window * M->embed_dim,
-                                     CACHE_ALIGN);
+        L->qkv_weight_offset  = bump(&off, 3ULL * aligned_embed_dim * aligned_embed_dim, CACHE_ALIGN);
+        L->qkv_bias_offset    = bump(&off, 3ULL * aligned_embed_dim, CACHE_ALIGN);
+        L->qkv_output_offset  = bump(&off, 3ULL * (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
 
-        L->proj_weight_offset = bump(&off, M->embed_dim * M->embed_dim, CACHE_ALIGN);
-        L->proj_bias_offset   = bump(&off, M->embed_dim, CACHE_ALIGN);
-        L->attention_output_offset =
-            bump(&off, (size_t)M->context_window * M->embed_dim, CACHE_ALIGN);
-        L->residual1_output_offset =
-            bump(&off, (size_t)M->context_window * M->embed_dim, CACHE_ALIGN);
+        L->proj_weight_offset = bump(&off, aligned_embed_dim * aligned_embed_dim, CACHE_ALIGN);
+        L->proj_bias_offset   = bump(&off, aligned_embed_dim, CACHE_ALIGN);
+        L->attention_output_offset     = bump(&off, (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
+        L->residual1_output_offset     = bump(&off, (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
 
-        L->ln2_weight_offset  = bump(&off, M->embed_dim, CACHE_ALIGN);
-        L->ln2_bias_offset    = bump(&off, M->embed_dim, CACHE_ALIGN);
-        L->ln2_output_offset  = bump(&off, (size_t)M->context_window * M->embed_dim, CACHE_ALIGN);
+        L->ln2_weight_offset  = bump(&off, aligned_embed_dim, CACHE_ALIGN);
+        L->ln2_bias_offset    = bump(&off, aligned_embed_dim, CACHE_ALIGN);
+        L->ln2_output_offset  = bump(&off, (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
 
-        L->fc1_weight_offset  = bump(&off, 4ULL * M->embed_dim * M->embed_dim, CACHE_ALIGN);
-        L->fc1_bias_offset    = bump(&off, 4ULL * M->embed_dim, CACHE_ALIGN);
-        L->fc2_weight_offset  = bump(&off, 4ULL * M->embed_dim * M->embed_dim, CACHE_ALIGN);
-        L->fc2_bias_offset    = bump(&off, M->embed_dim, CACHE_ALIGN);
-        L->mlp_output_offset  = bump(&off, (size_t)M->context_window * M->embed_dim, CACHE_ALIGN);
-        L->residual2_output_offset =
-            bump(&off, (size_t)M->context_window * M->embed_dim, CACHE_ALIGN);
+        L->fc1_weight_offset  = bump(&off, 4ULL * aligned_embed_dim * aligned_embed_dim, CACHE_ALIGN);
+        L->fc1_bias_offset    = bump(&off, 4ULL * aligned_embed_dim, CACHE_ALIGN);
+        L->fc2_weight_offset  = bump(&off, 4ULL * aligned_embed_dim * aligned_embed_dim, CACHE_ALIGN);
+        L->fc2_bias_offset    = bump(&off, aligned_embed_dim, CACHE_ALIGN);
+        L->mlp_output_offset  = bump(&off, (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
+        L->residual2_output_offset     = bump(&off, (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
     }
 
-    M->layer_stride =
-        M->layers[1].ln1_weight_offset - M->layers[0].ln1_weight_offset;
+    M->layer_stride = M->layers[1].ln1_weight_offset - M->layers[0].ln1_weight_offset;
 
-    /* final LN */
-    M->final_ln_weight_offset = bump(&off, M->embed_dim, CACHE_ALIGN);
-    M->final_ln_bias_offset   = bump(&off, M->embed_dim, CACHE_ALIGN);
+    // Final LayerNorm
+    M->final_ln_weight_offset = bump(&off, aligned_embed_dim, CACHE_ALIGN);
+    M->final_ln_bias_offset   = bump(&off, aligned_embed_dim, CACHE_ALIGN);
 
-    /* allocate once */
+    // Total memory required
     M->total_floats = off;
     M->memory_base  = huge_alloc(off * sizeof(float));
 }
