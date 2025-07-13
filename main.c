@@ -416,38 +416,46 @@ typedef struct
     float avg_error;
 } PerfStats;
 
-// Calculate performance metrics
-PerfStats calculate_perf(double time_sec, int M, int N, int K, float *C_ref, float *C_test)
+PerfStats calculate_perf(double time_sec, int M, int N, int K, float *C_ref, float *C_test, const char* algorithm)
 {
     PerfStats stats = {0};
-
     stats.time_sec = time_sec;
-
+    
     // GFLOPS calculation: 2*M*N*K operations (multiply-add)
     double total_ops = 2.0 * M * N * K;
     stats.gflops = total_ops / (time_sec * 1e9);
-
-    // Memory bandwidth (rough estimate)
-    // Reading A: M*K, Reading B: N*K, Writing C: M*N (all floats = 4 bytes)
-    double total_bytes = 4.0 * (M * K + N * K + M * N);
+    
+    // Memory bandwidth calculation depends on algorithm
+    double total_bytes;
+    
+    if (strstr(algorithm, "Naive") || strstr(algorithm, "naive")) {
+        // Naive GEMM: Each element of A and B is read M×N times
+        double actual_reads_a = (double)M * N * K * 4;  // A read M*N times per element
+        double actual_reads_b = (double)M * N * K * 4;  // B read M*N times per element  
+        double writes_c = (double)M * N * 4;            // C written once
+        total_bytes = actual_reads_a + actual_reads_b + writes_c;
+    } else {
+        // Optimized GEMM: Assume better cache behavior (closer to theoretical minimum)
+        // A: read M*K, B: read N*K, C: write M*N
+        // But with some cache misses, multiply by cache miss factor
+        double cache_miss_factor = 2.0;  // Estimate: each element read ~2x on average
+        total_bytes = cache_miss_factor * 4.0 * (M * K + N * K + M * N);
+    }
+    
     stats.bandwidth_gb_s = total_bytes / (time_sec * 1e9);
-
-    // Error analysis
-    if (C_ref && C_test)
-    {
+    
+    // Error analysis (unchanged)
+    if (C_ref && C_test) {
         float sum_error = 0.0f;
         stats.max_error = 0.0f;
-
-        for (int i = 0; i < M * N; i++)
-        {
+        for (int i = 0; i < M * N; i++) {
             float error = fabsf(C_test[i] - C_ref[i]);
-            if (error > stats.max_error)
-                stats.max_error = error;
+            if (error > stats.max_error) stats.max_error = error;
             sum_error += error;
         }
         stats.avg_error = sum_error / (M * N);
     }
-
+    
     return stats;
 }
 
@@ -482,7 +490,7 @@ void benchmark_gemm_variant(const char *name,
     gemm_func(A, B, bias, C, M, N, K);
     double t2 = get_time_sec();
 
-    PerfStats cold_stats = calculate_perf(t2 - t1, M, N, K, C_reference, C);
+    PerfStats cold_stats = calculate_perf(t2 - t1, M, N, K, C_reference, C, name);
     printf("  🧊 Cold cache: %.3f ms, %.2f GFLOPS, %.2f GB/s",
            cold_stats.time_sec * 1000, cold_stats.gflops, cold_stats.bandwidth_gb_s);
 
@@ -512,8 +520,8 @@ void benchmark_gemm_variant(const char *name,
     }
 
     double avg_time = total_time / benchmark_runs;
-    PerfStats warm_stats = calculate_perf(best_time, M, N, K, C_reference, C);
-    PerfStats avg_stats = calculate_perf(avg_time, M, N, K, C_reference, C);
+    PerfStats warm_stats = calculate_perf(best_time, M, N, K, C_reference, C, name);
+    PerfStats avg_stats = calculate_perf(avg_time, M, N, K, C_reference, C, name);
 
     printf("  🔥 Warm cache (best): %.3f ms, %.2f GFLOPS, %.2f GB/s\n",
            warm_stats.time_sec * 1000, warm_stats.gflops, warm_stats.bandwidth_gb_s);
