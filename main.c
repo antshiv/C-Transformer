@@ -623,6 +623,7 @@ int main(int argc, char **argv)
     /* defaults (tiny) */
     int L = 2, V = 32768, C = 128, T = 128;
     int do_alloc = 0;
+    int run_benchmarks = 0;
 
     static struct option long_opts[] = {
         {"layers", required_argument, 0, 'l'},
@@ -630,9 +631,10 @@ int main(int argc, char **argv)
         {"ctx", required_argument, 0, 't'},
         {"vocab", required_argument, 0, 'v'},
         {"force", no_argument, 0, 'f'},
+        {"benchmark", no_argument, 0, 'b'}, 
         {0, 0, 0, 0}};
     int c;
-    while ((c = getopt_long(argc, argv, "l:d:t:v:f", long_opts, NULL)) != -1)
+    while ((c = getopt_long(argc, argv, "l:d:t:v:f:b", long_opts, NULL)) != -1)
     {
         switch (c)
         {
@@ -651,8 +653,11 @@ int main(int argc, char **argv)
         case 'f':
             do_alloc = 1;
             break;
+        case 'b':
+            run_benchmarks = 1;
+            break;
         default:
-            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--force]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--force] [--benchmark]\n", argv[0]);
             return 1;
         }
     }
@@ -703,6 +708,12 @@ int main(int argc, char **argv)
                       : 1;
     M.tokens_per_core = (M.context_window + M.num_cores - 1) / M.num_cores;
     M.num_attention_heads = M.embed_dim / 64; // assume head_dim = 64
+
+    // Only run benchmarks if requested
+    if (do_alloc && run_benchmarks)
+    {
+        test_and_benchmark_gemm_enhanced(&M);
+    }
 
     printf("🧠 Detected %ld logical cores → reserving %d for OS → using %d for model\n",
            logical_cores, reserved_cores, M.num_cores);
