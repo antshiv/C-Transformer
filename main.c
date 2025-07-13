@@ -306,44 +306,36 @@ void gemm_1d(float *A, float *B, float *C, int M, int N, int K)
 void gemm_1d_avx512_enhanced(float *A, float *B, float *bias, float *C, int M, int N, int K)
 {
     const int simd_width = 16;
-
-    #pragma omp parallel for collapse(2) 
-    for (int i = 0; i < M; i++)
-    {
-        // Prefetch next row of A
-        if (i + 1 < M)
-        {
-            _mm_prefetch((char *)&A[(i + 1) * K], _MM_HINT_T0);
-        }
-
-        for (int j = 0; j < N; j++)
-        {
-            // Prefetch next row of B
-            if (j + 1 < N)
-            {
+    
+    #pragma omp parallel for collapse(2)
+    for (int i = 0; i < M; i++) {
+        for (int j = 0; j < N; j++) {
+            // Move prefetch INSIDE the collapsed loops
+            if (i + 1 < M) {
+                _mm_prefetch((char *)&A[(i + 1) * K], _MM_HINT_T0);
+            }
+            if (j + 1 < N) {
                 _mm_prefetch((char *)&B[(j + 1) * K], _MM_HINT_T0);
             }
-
+            
             __m512 sum_vec = _mm512_setzero_ps();
             int k;
-
+            
             // Main vectorized loop
-            for (k = 0; k <= K - simd_width; k += simd_width)
-            {
+            for (k = 0; k <= K - simd_width; k += simd_width) {
                 __m512 a_vec = _mm512_loadu_ps(&A[i * K + k]);
                 __m512 b_vec = _mm512_loadu_ps(&B[j * K + k]);
                 sum_vec = _mm512_fmadd_ps(a_vec, b_vec, sum_vec);
             }
-
+            
             // Horizontal reduction
             float sum = _mm512_reduce_add_ps(sum_vec);
-
+            
             // Handle remaining elements
-            for (; k < K; k++)
-            {
+            for (; k < K; k++) {
                 sum += A[i * K + k] * B[j * K + k];
             }
-
+            
             C[i * N + j] = sum + bias[j];
         }
     }
