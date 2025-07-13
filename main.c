@@ -287,6 +287,7 @@ void flush_cache(void *ptr, size_t bytes)
 // Your original naive implementation
 void gemm_1d(float *A, float *B, float *C, int M, int N, int K)
 {
+     #pragma omp parallel for collapse(2)  // Parallelize outer loops
     for (int i = 0; i < M; i++)
     {
         for (int j = 0; j < N; j++)
