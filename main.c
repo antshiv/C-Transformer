@@ -307,6 +307,7 @@ void gemm_1d_avx512_enhanced(float *A, float *B, float *bias, float *C, int M, i
 {
     const int simd_width = 16;
 
+    #pragma omp parallel for collapse(2) 
     for (int i = 0; i < M; i++)
     {
         // Prefetch next row of A
@@ -354,6 +355,7 @@ void gemm_1d_blocked(float *A, float *B, float *bias, float *C, int M, int N, in
     const int block_size = 64; // Tune based on cache size
 
     // Initialize C with bias
+    #pragma omp parallel for collapse(2) 
     for (int i = 0; i < M; i++)
     {
         for (int j = 0; j < N; j++)
@@ -363,6 +365,7 @@ void gemm_1d_blocked(float *A, float *B, float *bias, float *C, int M, int N, in
     }
 
     // Blocked multiplication
+    #pragma omp parallel for collapse(3) 
     for (int ii = 0; ii < M; ii += block_size)
     {
         for (int jj = 0; jj < N; jj += block_size)
