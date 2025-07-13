@@ -452,96 +452,98 @@ PerfStats calculate_perf(double time_sec, int M, int N, int K, float *C_ref, flo
     return stats;
 }
 
-void benchmark_gemm_variant(const char *name, 
-                           void (*gemm_func)(float*, float*, float*, float*, int, int, int),
-                           float *A, float *B, float *bias, float *C, 
-                           int M, int N, int K, 
-                           float *C_reference,
-                           int warmup_runs, int benchmark_runs) {
-    
+void benchmark_gemm_variant(const char *name,
+                            void (*gemm_func)(float *, float *, float *, float *, int, int, int),
+                            float *A, float *B, float *bias, float *C,
+                            int M, int N, int K,
+                            float *C_reference,
+                            int warmup_runs, int benchmark_runs)
+{
+
     printf("\n🔬 Testing %s:\n", name);
-    
+
     /*
      * ═══════════════════════════════════════════════════════════════════
      * NOTE: Warm Cache Testing Disabled - Here's Why
      * ═══════════════════════════════════════════════════════════════════
-     * 
+     *
      * Warm cache measurements have significant overhead that distorts results:
-     * 
+     *
      * 1. Cache Warming Overhead:
-     *    - 3 warmup runs × 15+ seconds = 45+ seconds overhead  
+     *    - 3 warmup runs × 15+ seconds = 45+ seconds overhead
      *    - Each warmup touches 268 MB (A + B matrices)
      *    - Total: ~10x longer wall time than displayed measurement
-     * 
+     *
      * 2. Multiple Benchmark Runs:
      *    - 10 benchmark runs × (warming + 15s execution) = 200+ seconds
      *    - Only the fastest 15s is reported, hiding 185+ seconds of overhead
      *    - Creates false impression of "warm cache" performance
-     * 
+     *
      * 3. Real-World Relevance:
      *    - Our 409 GB model exceeds all cache levels anyway
      *    - AI inference typically starts with cold weights (first query)
      *    - Production systems have memory pressure from other processes
      *    - Cold cache represents realistic deployment scenarios
-     * 
+     *
      * 4. Measurement Accuracy:
      *    - Wall clock time: 2-3 minutes total per algorithm
      *    - Displayed time: ~15 seconds (only GEMM execution)
      *    - The "warm cache" measurement doesn't account for warming overhead
-     * 
+     *
      * CONCLUSION: Cold cache provides more realistic and honest performance
      * measurements for large-scale AI workloads. The 4.3x speedup from our
      * blocked implementation on cold cache is what users will actually see.
      */
-    
+
     // Warmup runs (DISABLED - see note above)
     // for (int r = 0; r < warmup_runs; r++) {
     //     warm_cache(A, M * K * sizeof(float));
     //     warm_cache(B, N * K * sizeof(float));
     //     gemm_func(A, B, bias, C, M, N, K);
     // }
-    
+
     // Cold cache benchmark - most realistic for AI workloads
     printf("  🧊 Testing cold cache performance (most realistic for AI)...\n");
     flush_cache(A, M * K * sizeof(float));
     flush_cache(B, N * K * sizeof(float));
     flush_cache(C, M * N * sizeof(float));
     _mm_mfence();
-    
+
     double t1 = get_time_sec();
     gemm_func(A, B, bias, C, M, N, K);
     double t2 = get_time_sec();
-    
+
     PerfStats cold_stats = calculate_perf(t2 - t1, M, N, K, C_reference, C, name);
-    printf("  🧊 Cold cache: %.3f ms, %.2f GFLOPS, %.2f GB/s", 
+    printf("  🧊 Cold cache: %.3f ms, %.2f GFLOPS, %.2f GB/s",
            cold_stats.time_sec * 1000, cold_stats.gflops, cold_stats.bandwidth_gb_s);
-    
-    if (C_reference) {
+
+    if (C_reference)
+    {
         printf(", max_err: %.2e", cold_stats.max_error);
     }
     printf("\n");
-    
+
     // Warm cache benchmark (DISABLED - see note above)
     // The overhead of cache warming and multiple runs makes this measurement
     // misleading for large AI workloads. Users care about cold performance.
     /*
     double best_time = 1e9;
     double total_time = 0.0;
-    
+
     for (int r = 0; r < benchmark_runs; r++) {
         warm_cache(A, M * K * sizeof(float));
         warm_cache(B, N * K * sizeof(float));
-        
+
         double t1 = get_time_sec();
         gemm_func(A, B, bias, C, M, N, K);
         double t2 = get_time_sec();
-        
+
         double run_time = t2 - t1;
         if (run_time < best_time) best_time = run_time;
         total_time += run_time;
     }
     */
-    
+
     printf("  ✅ Completed realistic cold cache benchmark\n");
 }
 
@@ -650,7 +652,7 @@ void test_and_benchmark_gemm_enhanced(TransformerModel *M)
  * ═══════════════════════════════════════════════════════════════════
  * TOKEN-PARALLEL CORE ORCHESTRATION BENCHMARK
  * ═══════════════════════════════════════════════════════════════════
- * 
+ *
  * Tests the fundamental unit of AI computation:
  * - Per-core token processing (W×x + b = c)
  * - 4 contiguous memory streams per core (no false sharing)
@@ -666,252 +668,273 @@ void test_and_benchmark_gemm_enhanced(TransformerModel *M)
 #include <omp.h>
 
 // Core stream tracking structure
-typedef struct {
+typedef struct
+{
     // Stream pointers (cache-aligned, no false sharing)
-    float *input_stream;      // Core's token embeddings (read)
-    float *weights_stream;    // Shared weight matrix (read)  
-    float *bias_stream;       // Shared bias vector (read)
-    float *output_stream;     // Core's output (write, exclusive)
-    
+    float *input_stream;   // Core's token embeddings (read)
+    float *weights_stream; // Shared weight matrix (read)
+    float *bias_stream;    // Shared bias vector (read)
+    float *output_stream;  // Core's output (write, exclusive)
+
     // Performance metrics
     int core_id;
     int tokens_assigned;
     double computation_time_sec;
     double tokens_per_sec;
-    
+
     // Memory access tracking
     uint64_t input_bytes_accessed;
     uint64_t weights_bytes_accessed;
     uint64_t output_bytes_written;
     double effective_bandwidth_gbps;
-    
+
     // Per-token timing (optional, can disable for performance)
     double *per_token_times;
     int track_per_token;
 } CoreStreamMetrics;
 
 // Setup core-local memory streams (ensuring no false sharing)
-void setup_core_streams(TransformerModel *M, int core_id, CoreStreamMetrics *metrics) {
+void setup_core_streams(TransformerModel *M, int core_id, CoreStreamMetrics *metrics)
+{
     metrics->core_id = core_id;
     metrics->tokens_assigned = M->tokens_per_core;
-    
+
     // Calculate this core's token range
     int token_start = core_id * M->tokens_per_core;
     int token_end = token_start + M->tokens_per_core;
-    if (token_end > M->context_window) {
+    if (token_end > M->context_window)
+    {
         token_end = M->context_window;
         metrics->tokens_assigned = token_end - token_start;
     }
-    
+
     // Input stream: contiguous tokens for this core (cache-aligned)
-    metrics->input_stream = get_slice(M, core_id, 
-                                     M->layers[0].layer_input_offset,
-                                     M->aligned_embed_dim);
-    
+    metrics->input_stream = get_slice(M, core_id,
+                                      M->layers[0].layer_input_offset,
+                                      M->aligned_embed_dim);
+
     // Weights stream: shared read-only (all cores access same weights)
     metrics->weights_stream = M->memory_base + M->layers[0].qkv_weight_offset;
-    
-    // Bias stream: shared read-only 
+
+    // Bias stream: shared read-only
     metrics->bias_stream = M->memory_base + M->layers[0].qkv_bias_offset;
-    
+
     // Output stream: core-exclusive write region (cache-aligned, no sharing)
     metrics->output_stream = get_slice(M, core_id,
-                                      M->layers[0].qkv_output_offset,
-                                      3 * M->aligned_embed_dim);
-    
+                                       M->layers[0].qkv_output_offset,
+                                       3 * M->aligned_embed_dim);
+
     // Initialize tracking
     metrics->input_bytes_accessed = 0;
     metrics->weights_bytes_accessed = 0;
     metrics->output_bytes_written = 0;
-    
-    printf("Core %d: tokens [%d:%d], input=%p, output=%p\n", 
-           core_id, token_start, token_end-1, 
-           (void*)metrics->input_stream, (void*)metrics->output_stream);
+
+    printf("Core %d: tokens [%d:%d], input=%p, output=%p\n",
+           core_id, token_start, token_end - 1,
+           (void *)metrics->input_stream, (void *)metrics->output_stream);
 }
 
 // Core-local W×x + b computation (this core's tokens only)
-void core_token_gemm(CoreStreamMetrics *metrics, int embed_dim, int output_dim, 
-                     int track_per_token) {
-    
-    float *x = metrics->input_stream;      // Input tokens [tokens × embed_dim]
-    float *W = metrics->weights_stream;    // Weights [output_dim × embed_dim] 
-    float *b = metrics->bias_stream;       // Bias [output_dim]
-    float *y = metrics->output_stream;     // Output [tokens × output_dim]
-    
+void core_token_gemm(CoreStreamMetrics *metrics, int embed_dim, int output_dim,
+                     int track_per_token)
+{
+
+    float *x = metrics->input_stream;   // Input tokens [tokens × embed_dim]
+    float *W = metrics->weights_stream; // Weights [output_dim × embed_dim]
+    float *b = metrics->bias_stream;    // Bias [output_dim]
+    float *y = metrics->output_stream;  // Output [tokens × output_dim]
+
     int num_tokens = metrics->tokens_assigned;
-    
-    if (track_per_token) {
+
+    if (track_per_token)
+    {
         metrics->per_token_times = malloc(num_tokens * sizeof(double));
     }
-    
+
     double core_start = get_time_sec();
-    
+
     // Process each token assigned to this core
-    for (int t = 0; t < num_tokens; t++) {
+    for (int t = 0; t < num_tokens; t++)
+    {
         double token_start = track_per_token ? get_time_sec() : 0.0;
-        
+
         // Prefetch next token if available
-        if (t + 1 < num_tokens) {
-            _mm_prefetch((char*)&x[(t+1) * embed_dim], _MM_HINT_T0);
+        if (t + 1 < num_tokens)
+        {
+            _mm_prefetch((char *)&x[(t + 1) * embed_dim], _MM_HINT_T0);
         }
-        
+
         // Compute y[t] = W × x[t] + b for this token
         // Each output element y[t][i] = dot_product(W[i,:], x[t,:]) + b[i]
-        for (int i = 0; i < output_dim; i++) {
+        for (int i = 0; i < output_dim; i++)
+        {
             __m512 sum_vec = _mm512_setzero_ps();
-            
+
             // Dot product: W[i,:] · x[t,:] (one output element at a time)
-            for (int j = 0; j < embed_dim; j += 16) {
+            for (int j = 0; j < embed_dim; j += 16)
+            {
                 // Load input vector chunk (aligned)
                 __m512 x_vec = _mm512_load_ps(&x[t * embed_dim + j]);
-                
-                // Load corresponding weight matrix row chunk (aligned)  
+
+                // Load corresponding weight matrix row chunk (aligned)
                 __m512 w_vec = _mm512_load_ps(&W[i * embed_dim + j]);
-                
+
                 // Accumulate dot product
                 sum_vec = _mm512_fmadd_ps(w_vec, x_vec, sum_vec);
-                
+
                 // Track memory access
                 metrics->input_bytes_accessed += 16 * sizeof(float);
                 metrics->weights_bytes_accessed += 16 * sizeof(float);
             }
-            
+
             // Horizontal reduction to get final dot product
             float dot_product = _mm512_reduce_add_ps(sum_vec);
-            
+
             // Store single result with bias
             y[t * output_dim + i] = dot_product + b[i];
             metrics->output_bytes_written += sizeof(float);
         }
-        
-        if (track_per_token) {
+
+        if (track_per_token)
+        {
             double token_end = get_time_sec();
             metrics->per_token_times[t] = token_end - token_start;
         }
     }
-    
+
     double core_end = get_time_sec();
     metrics->computation_time_sec = core_end - core_start;
     metrics->tokens_per_sec = num_tokens / metrics->computation_time_sec;
-    
+
     // Calculate effective bandwidth
-    uint64_t total_bytes = metrics->input_bytes_accessed + 
-                          metrics->weights_bytes_accessed + 
-                          metrics->output_bytes_written;
+    uint64_t total_bytes = metrics->input_bytes_accessed +
+                           metrics->weights_bytes_accessed +
+                           metrics->output_bytes_written;
     metrics->effective_bandwidth_gbps = total_bytes / (metrics->computation_time_sec * 1e9);
 }
 
 // Main token-parallel orchestration benchmark
-void benchmark_token_parallel_orchestration(TransformerModel *M, int track_per_token) {
+void benchmark_token_parallel_orchestration(TransformerModel *M, int track_per_token)
+{
     printf("\n🎯 Token-Parallel Core Orchestration Benchmark\n");
     printf("════════════════════════════════════════════════\n");
-    
+
     printf("🧠 Model configuration:\n");
     printf("  Cores available: %d\n", M->num_cores);
     printf("  Total tokens: %d\n", M->context_window);
     printf("  Tokens per core: %d\n", M->tokens_per_core);
     printf("  Embed dimension: %d\n", M->embed_dim);
     printf("  QKV output dimension: %d\n", 3 * M->embed_dim);
-    
+
     // Allocate metrics for all cores
     CoreStreamMetrics *all_metrics = calloc(M->num_cores, sizeof(CoreStreamMetrics));
-    
+
     // Initialize test data
     TrulyOptimalLayer *L = &M->layers[0];
     float *input_base = M->memory_base + L->layer_input_offset;
-    float *weights = M->memory_base + L->qkv_weight_offset; 
+    float *weights = M->memory_base + L->qkv_weight_offset;
     float *bias = M->memory_base + L->qkv_bias_offset;
-    
+
     // Initialize with realistic patterns
     srand(42);
-    for (int i = 0; i < M->context_window * M->embed_dim; i++) {
+    for (int i = 0; i < M->context_window * M->embed_dim; i++)
+    {
         input_base[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
     }
-    for (int i = 0; i < 3 * M->embed_dim * M->embed_dim; i++) {
+    for (int i = 0; i < 3 * M->embed_dim * M->embed_dim; i++)
+    {
         weights[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.05f;
     }
-    for (int i = 0; i < 3 * M->embed_dim; i++) {
+    for (int i = 0; i < 3 * M->embed_dim; i++)
+    {
         bias[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.01f;
     }
-    
+
     printf("\n🌊 Setting up %d core streams...\n", M->num_cores);
-    
+
     double total_start = get_time_sec();
-    
-    // Token-parallel processing across cores
-    #pragma omp parallel num_threads(M->num_cores)
+
+// Token-parallel processing across cores
+#pragma omp parallel num_threads(M->num_cores)
     {
         int core_id = omp_get_thread_num();
         CoreStreamMetrics *metrics = &all_metrics[core_id];
-        
+
         // Setup this core's memory streams
         setup_core_streams(M, core_id, metrics);
-        
+
         // Process this core's assigned tokens
         core_token_gemm(metrics, M->embed_dim, 3 * M->embed_dim, track_per_token);
     }
-    
+
     double total_end = get_time_sec();
     double total_time = total_end - total_start;
-    
+
     // Analyze results
     printf("\n📊 Performance Analysis:\n");
     printf("════════════════════════\n");
-    
+
     // Per-core analysis
     double total_tokens_processed = 0;
     double total_bandwidth = 0;
     double slowest_core = 0;
     double fastest_core = 1e9;
-    
-    for (int c = 0; c < M->num_cores; c++) {
+
+    for (int c = 0; c < M->num_cores; c++)
+    {
         CoreStreamMetrics *m = &all_metrics[c];
-        
+
         printf("Core %2d: %d tokens, %.3f ms, %.1f tokens/sec, %.1f GB/s\n",
-               m->core_id, m->tokens_assigned, 
+               m->core_id, m->tokens_assigned,
                m->computation_time_sec * 1000,
                m->tokens_per_sec, m->effective_bandwidth_gbps);
-        
+
         total_tokens_processed += m->tokens_assigned;
         total_bandwidth += m->effective_bandwidth_gbps;
-        
-        if (m->computation_time_sec > slowest_core) slowest_core = m->computation_time_sec;
-        if (m->computation_time_sec < fastest_core) fastest_core = m->computation_time_sec;
-        
+
+        if (m->computation_time_sec > slowest_core)
+            slowest_core = m->computation_time_sec;
+        if (m->computation_time_sec < fastest_core)
+            fastest_core = m->computation_time_sec;
+
         // Per-token analysis (if enabled)
-        if (track_per_token && m->per_token_times) {
+        if (track_per_token && m->per_token_times)
+        {
             double min_token_time = 1e9, max_token_time = 0, avg_token_time = 0;
-            for (int t = 0; t < m->tokens_assigned; t++) {
+            for (int t = 0; t < m->tokens_assigned; t++)
+            {
                 double tt = m->per_token_times[t];
-                if (tt < min_token_time) min_token_time = tt;
-                if (tt > max_token_time) max_token_time = tt;
+                if (tt < min_token_time)
+                    min_token_time = tt;
+                if (tt > max_token_time)
+                    max_token_time = tt;
                 avg_token_time += tt;
             }
             avg_token_time /= m->tokens_assigned;
-            
+
             printf("  └─ Per token: min=%.3f ms, avg=%.3f ms, max=%.3f ms\n",
                    min_token_time * 1000, avg_token_time * 1000, max_token_time * 1000);
-            
+
             free(m->per_token_times);
         }
     }
-    
+
     // System-wide metrics
     printf("\n🎯 System-Wide Performance:\n");
     printf("  Total tokens processed: %.0f\n", total_tokens_processed);
     printf("  Total execution time: %.3f ms\n", total_time * 1000);
     printf("  Aggregate throughput: %.1f tokens/sec\n", total_tokens_processed / total_time);
     printf("  Total memory bandwidth: %.1f GB/s\n", total_bandwidth);
-    printf("  Core load balance: %.1f%% (fastest/slowest ratio)\n", 
+    printf("  Core load balance: %.1f%% (fastest/slowest ratio)\n",
            100.0 * fastest_core / slowest_core);
-    
+
     // Per-token unit performance
     double avg_time_per_token = total_time / total_tokens_processed;
     printf("\n⚡ Unit Performance Metrics:\n");
     printf("  Average time per token: %.6f ms\n", avg_time_per_token * 1000);
-    printf("  Tokens per second per core: %.1f\n", 
+    printf("  Tokens per second per core: %.1f\n",
            (total_tokens_processed / total_time) / M->num_cores);
-    
+
     // Extrapolation to large models
     printf("\n🔮 Large Model Extrapolation:\n");
     printf("  For 96-layer model (~5 ops per token):\n");
@@ -920,22 +943,23 @@ void benchmark_token_parallel_orchestration(TransformerModel *M, int track_per_t
     printf("  For 500GB model (~200 layers):\n");
     printf("    Time per token: %.3f ms\n", avg_time_per_token * 10 * 1000);
     printf("    Throughput: %.1f tokens/sec\n", 1.0 / (avg_time_per_token * 10));
-    
+
     free(all_metrics);
 }
 
 // Test driver with options
-void test_token_parallel_performance(TransformerModel *M) {
+void test_token_parallel_performance(TransformerModel *M)
+{
     printf("\n🚀 Token-Parallel Performance Testing\n");
     printf("═══════════════════════════════════════\n");
-    
+
     // Test 1: With per-token tracking (slower but detailed)
     printf("\n📈 Test 1: Detailed per-token analysis\n");
-    benchmark_token_parallel_orchestration(M, 1);  // track_per_token = 1
-    
+    benchmark_token_parallel_orchestration(M, 1); // track_per_token = 1
+
     // Test 2: Core-level only (faster, production-like)
     printf("\n🏎️  Test 2: Core-level performance (production mode)\n");
-    benchmark_token_parallel_orchestration(M, 0);  // track_per_token = 0
+    benchmark_token_parallel_orchestration(M, 0); // track_per_token = 0
 }
 
 /* ---------------- main with --size-only / --force -------------------- */
@@ -1034,6 +1058,10 @@ int main(int argc, char **argv)
     if (do_alloc && run_benchmarks)
     {
         test_and_benchmark_gemm_enhanced(&M);
+
+        // NEW: Add token-parallel orchestration test
+        printf("\n🎯 Testing Token-Parallel Core Orchestration...\n");
+        test_token_parallel_performance(&M);
     }
 
     printf("🧠 Detected %ld logical cores → reserving %d for OS → using %d for model\n",
