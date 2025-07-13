@@ -547,72 +547,74 @@ void blocked_wrapper(float *A, float *B, float *bias, float *C, int M, int N, in
     gemm_1d_blocked(A, B, bias, C, M, N, K);
 }
 
-void test_and_benchmark_gemm_enhanced(TransformerModel *M)
-{
-    if (M->embed_dim % 16 != 0)
-    {
+void test_and_benchmark_gemm_enhanced(TransformerModel *M) {
+    if (M->embed_dim % 16 != 0) {
         fprintf(stderr, "⚠️  embed_dim must be divisible by 16 for AVX-512\n");
         return;
     }
-
-    size_t off = M->total_floats;
+    
     int M_dim = M->context_window;
-    int N_dim = M->context_window;
+    int N_dim = M->context_window; 
     int K_dim = M->embed_dim;
-
+    
     printf("\n🧪 Enhanced GEMM Benchmarks (M=%d, N=%d, K=%d)\n", M_dim, N_dim, K_dim);
     printf("📊 Problem size: %.2f MB matrices, %.2f GFLOP operation\n",
            (M_dim * K_dim + N_dim * K_dim + M_dim * N_dim) * 4.0 / 1e6,
            2.0 * M_dim * N_dim * K_dim / 1e9);
-
-#define SLICE(name, count) float *name = M->memory_base + bump(&off, (count), CACHE_ALIGN / sizeof(float))
-    SLICE(A, M_dim * K_dim);
-    SLICE(B, N_dim * K_dim);
-    SLICE(bias, N_dim);
-    SLICE(C_naive, M_dim * N_dim);
-    SLICE(C_avx512, M_dim * N_dim);
-    SLICE(C_blocked, M_dim * N_dim);
-
+    
+    // USE EXISTING MODEL MEMORY INSTEAD OF ALLOCATING NEW
+    TrulyOptimalLayer *L = &M->layers[0];  // Use first layer for testing
+    
+    float *A = M->memory_base + L->layer_input_offset;     // Use layer input as A
+    float *B = M->memory_base + L->qkv_weight_offset;      // Use QKV weights as B  
+    float *bias = M->memory_base + L->qkv_bias_offset;     // Use QKV bias
+    float *C_naive = M->memory_base + L->qkv_output_offset; // Use QKV output for result
+    
+    // For comparison, we need another output buffer - use next layer's input
+    float *C_avx512 = M->memory_base + M->layers[1].layer_input_offset;
+    float *C_blocked = M->memory_base + M->layers[1].ln1_output_offset;
+    
+    printf("🎯 Using actual model memory:\n");
+    printf("  A (input): %p\n", (void*)A);
+    printf("  B (weights): %p\n", (void*)B);
+    printf("  C (output): %p\n", (void*)C_naive);
+    
     // Initialize with realistic AI patterns
-    srand(42); // Reproducible
-    for (int i = 0; i < M_dim * K_dim; ++i)
-    {
-        A[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f; // Typical activation range
+    srand(42);  
+    for (int i = 0; i < M_dim * K_dim; ++i) {
+        A[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;  
     }
-    for (int i = 0; i < N_dim * K_dim; ++i)
-    {
-        B[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.05f; // Typical weight range
+    for (int i = 0; i < N_dim * K_dim; ++i) {
+        B[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.05f; 
     }
-    for (int i = 0; i < N_dim; ++i)
-    {
-        bias[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.01f; // Small bias
+    for (int i = 0; i < N_dim; ++i) {
+        bias[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.01f; 
     }
-
+    
     const int warmup_runs = 3;
     const int benchmark_runs = 10;
-
-    // Test naive implementation (reference)
+    
+    // Test naive implementation (reference) 
     benchmark_gemm_variant("Naive GEMM + Bias", naive_wrapper,
-                           A, B, bias, C_naive, M_dim, N_dim, K_dim,
-                           NULL, warmup_runs, benchmark_runs);
-
+                          A, B, bias, C_naive, M_dim, N_dim, K_dim, 
+                          NULL, warmup_runs, benchmark_runs);
+    
     // Test AVX-512 implementation
     benchmark_gemm_variant("AVX-512 GEMM", avx512_wrapper,
-                           A, B, bias, C_avx512, M_dim, N_dim, K_dim,
-                           C_naive, warmup_runs, benchmark_runs);
-
-    // Test blocked implementation
+                          A, B, bias, C_avx512, M_dim, N_dim, K_dim, 
+                          C_naive, warmup_runs, benchmark_runs);
+    
+    // Test blocked implementation  
     benchmark_gemm_variant("Blocked AVX-512 GEMM", blocked_wrapper,
-                           A, B, bias, C_blocked, M_dim, N_dim, K_dim,
-                           C_naive, warmup_runs, benchmark_runs);
-
-    // Summary comparison
+                          A, B, bias, C_blocked, M_dim, N_dim, K_dim, 
+                          C_naive, warmup_runs, benchmark_runs);
+    
     printf("\n📈 Performance Summary:\n");
     printf("  Naive implementation provides baseline correctness\n");
     printf("  AVX-512 should show ~8-16x speedup (if memory-bound)\n");
     printf("  Blocked version should show better cache efficiency\n");
-
-    M->total_floats = off;
+    
+    // DON'T modify M->total_floats since we used existing memory
 }
 
 /* End of GEMM section */
