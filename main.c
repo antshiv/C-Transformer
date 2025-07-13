@@ -287,7 +287,7 @@ void flush_cache(void *ptr, size_t bytes)
 // Your original naive implementation
 void gemm_1d(float *A, float *B, float *C, int M, int N, int K)
 {
-     #pragma omp parallel for collapse(2)  // Parallelize outer loops
+#pragma omp parallel for collapse(2) // Parallelize outer loops
     for (int i = 0; i < M; i++)
     {
         for (int j = 0; j < N; j++)
@@ -306,36 +306,42 @@ void gemm_1d(float *A, float *B, float *C, int M, int N, int K)
 void gemm_1d_avx512_enhanced(float *A, float *B, float *bias, float *C, int M, int N, int K)
 {
     const int simd_width = 16;
-    
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < N; j++) {
+
+#pragma omp parallel for collapse(2)
+    for (int i = 0; i < M; i++)
+    {
+        for (int j = 0; j < N; j++)
+        {
             // Move prefetch INSIDE the collapsed loops
-            if (i + 1 < M) {
+            if (i + 1 < M)
+            {
                 _mm_prefetch((char *)&A[(i + 1) * K], _MM_HINT_T0);
             }
-            if (j + 1 < N) {
+            if (j + 1 < N)
+            {
                 _mm_prefetch((char *)&B[(j + 1) * K], _MM_HINT_T0);
             }
-            
+
             __m512 sum_vec = _mm512_setzero_ps();
             int k;
-            
+
             // Main vectorized loop
-            for (k = 0; k <= K - simd_width; k += simd_width) {
+            for (k = 0; k <= K - simd_width; k += simd_width)
+            {
                 __m512 a_vec = _mm512_loadu_ps(&A[i * K + k]);
                 __m512 b_vec = _mm512_loadu_ps(&B[j * K + k]);
                 sum_vec = _mm512_fmadd_ps(a_vec, b_vec, sum_vec);
             }
-            
+
             // Horizontal reduction
             float sum = _mm512_reduce_add_ps(sum_vec);
-            
+
             // Handle remaining elements
-            for (; k < K; k++) {
+            for (; k < K; k++)
+            {
                 sum += A[i * K + k] * B[j * K + k];
             }
-            
+
             C[i * N + j] = sum + bias[j];
         }
     }
@@ -346,8 +352,8 @@ void gemm_1d_blocked(float *A, float *B, float *bias, float *C, int M, int N, in
 {
     const int block_size = 64; // Tune based on cache size
 
-    // Initialize C with bias
-    #pragma omp parallel for collapse(2) 
+// Initialize C with bias
+#pragma omp parallel for collapse(2)
     for (int i = 0; i < M; i++)
     {
         for (int j = 0; j < N; j++)
@@ -356,8 +362,8 @@ void gemm_1d_blocked(float *A, float *B, float *bias, float *C, int M, int N, in
         }
     }
 
-    // Blocked multiplication
-    #pragma omp parallel for collapse(3) 
+// Blocked multiplication
+#pragma omp parallel for collapse(3)
     for (int ii = 0; ii < M; ii += block_size)
     {
         for (int jj = 0; jj < N; jj += block_size)
@@ -378,8 +384,8 @@ void gemm_1d_blocked(float *A, float *B, float *bias, float *C, int M, int N, in
 
                         for (k = kk; k <= k_end - 16; k += 16)
                         {
-                            __m512 a_vec = _mm512_loadu_ps(&A[i * K + k]);
-                            __m512 b_vec = _mm512_loadu_ps(&B[j * K + k]);
+                            __m512 a_vec = _mm512_load_ps(&A[i * K + k]);
+                            __m512 b_vec = _mm512_load_ps(&B[j * K + k]);
                             sum_vec = _mm512_fmadd_ps(a_vec, b_vec, sum_vec);
                         }
 
@@ -408,46 +414,41 @@ typedef struct
     float avg_error;
 } PerfStats;
 
-PerfStats calculate_perf(double time_sec, int M, int N, int K, float *C_ref, float *C_test, const char* algorithm)
+PerfStats calculate_perf(double time_sec, int M, int N, int K, float *C_ref, float *C_test, const char *algorithm)
 {
     PerfStats stats = {0};
     stats.time_sec = time_sec;
-    
+
     // GFLOPS calculation: 2*M*N*K operations (multiply-add)
     double total_ops = 2.0 * M * N * K;
     stats.gflops = total_ops / (time_sec * 1e9);
-    
+
     // Memory bandwidth calculation depends on algorithm
     double total_bytes;
-    
-    if (strstr(algorithm, "Naive") || strstr(algorithm, "naive")) {
-        // Naive GEMM: Each element of A and B is read M×N times
-        double actual_reads_a = (double)M * N * K * 4;  // A read M*N times per element
-        double actual_reads_b = (double)M * N * K * 4;  // B read M*N times per element  
-        double writes_c = (double)M * N * 4;            // C written once
-        total_bytes = actual_reads_a + actual_reads_b + writes_c;
-    } else {
-        // Optimized GEMM: Assume better cache behavior (closer to theoretical minimum)
-        // A: read M*K, B: read N*K, C: write M*N
-        // But with some cache misses, multiply by cache miss factor
-        double cache_miss_factor = 2.0;  // Estimate: each element read ~2x on average
-        total_bytes = cache_miss_factor * 4.0 * (M * K + N * K + M * N);
-    }
-    
+
+    // Naive, AVX-512 (non-blocked) - same memory pattern!
+    double actual_reads_a = (double)M * N * K * 4;
+    double actual_reads_b = (double)M * N * K * 4;
+    double writes_c = (double)M * N * 4;
+    total_bytes = actual_reads_a + actual_reads_b + writes_c;
+
     stats.bandwidth_gb_s = total_bytes / (time_sec * 1e9);
-    
+
     // Error analysis (unchanged)
-    if (C_ref && C_test) {
+    if (C_ref && C_test)
+    {
         float sum_error = 0.0f;
         stats.max_error = 0.0f;
-        for (int i = 0; i < M * N; i++) {
+        for (int i = 0; i < M * N; i++)
+        {
             float error = fabsf(C_test[i] - C_ref[i]);
-            if (error > stats.max_error) stats.max_error = error;
+            if (error > stats.max_error)
+                stats.max_error = error;
             sum_error += error;
         }
         stats.avg_error = sum_error / (M * N);
     }
-    
+
     return stats;
 }
 
@@ -551,73 +552,78 @@ void blocked_wrapper(float *A, float *B, float *bias, float *C, int M, int N, in
     gemm_1d_blocked(A, B, bias, C, M, N, K);
 }
 
-void test_and_benchmark_gemm_enhanced(TransformerModel *M) {
-    if (M->embed_dim % 16 != 0) {
+void test_and_benchmark_gemm_enhanced(TransformerModel *M)
+{
+    if (M->embed_dim % 16 != 0)
+    {
         fprintf(stderr, "⚠️  embed_dim must be divisible by 16 for AVX-512\n");
         return;
     }
-    
+
     int M_dim = M->context_window;
-    int N_dim = M->context_window; 
+    int N_dim = M->context_window;
     int K_dim = M->embed_dim;
-    
+
     printf("\n🧪 Enhanced GEMM Benchmarks (M=%d, N=%d, K=%d)\n", M_dim, N_dim, K_dim);
     printf("📊 Problem size: %.2f MB matrices, %.2f GFLOP operation\n",
            (M_dim * K_dim + N_dim * K_dim + M_dim * N_dim) * 4.0 / 1e6,
            2.0 * M_dim * N_dim * K_dim / 1e9);
-    
+
     // USE EXISTING MODEL MEMORY INSTEAD OF ALLOCATING NEW
-    TrulyOptimalLayer *L = &M->layers[0];  // Use first layer for testing
-    
-    float *A = M->memory_base + L->layer_input_offset;     // Use layer input as A
-    float *B = M->memory_base + L->qkv_weight_offset;      // Use QKV weights as B  
-    float *bias = M->memory_base + L->qkv_bias_offset;     // Use QKV bias
+    TrulyOptimalLayer *L = &M->layers[0]; // Use first layer for testing
+
+    float *A = M->memory_base + L->layer_input_offset;      // Use layer input as A
+    float *B = M->memory_base + L->qkv_weight_offset;       // Use QKV weights as B
+    float *bias = M->memory_base + L->qkv_bias_offset;      // Use QKV bias
     float *C_naive = M->memory_base + L->qkv_output_offset; // Use QKV output for result
-    
+
     // For comparison, we need another output buffer - use next layer's input
     float *C_avx512 = M->memory_base + M->layers[1].layer_input_offset;
     float *C_blocked = M->memory_base + M->layers[1].ln1_output_offset;
-    
+
     printf("🎯 Using actual model memory:\n");
-    printf("  A (input): %p\n", (void*)A);
-    printf("  B (weights): %p\n", (void*)B);
-    printf("  C (output): %p\n", (void*)C_naive);
-    
+    printf("  A (input): %p\n", (void *)A);
+    printf("  B (weights): %p\n", (void *)B);
+    printf("  C (output): %p\n", (void *)C_naive);
+
     // Initialize with realistic AI patterns
-    srand(42);  
-    for (int i = 0; i < M_dim * K_dim; ++i) {
-        A[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;  
+    srand(42);
+    for (int i = 0; i < M_dim * K_dim; ++i)
+    {
+        A[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
     }
-    for (int i = 0; i < N_dim * K_dim; ++i) {
-        B[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.05f; 
+    for (int i = 0; i < N_dim * K_dim; ++i)
+    {
+        B[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.05f;
     }
-    for (int i = 0; i < N_dim; ++i) {
-        bias[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.01f; 
+    for (int i = 0; i < N_dim; ++i)
+    {
+        bias[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.01f;
     }
-    
+
     const int warmup_runs = 3;
     const int benchmark_runs = 10;
-    
-    // Test naive implementation (reference) 
+
+    // Test naive implementation (reference)
     benchmark_gemm_variant("Naive GEMM + Bias", naive_wrapper,
-                          A, B, bias, C_naive, M_dim, N_dim, K_dim, 
-                          NULL, warmup_runs, benchmark_runs);
-    
+                           A, B, bias, C_naive, M_dim, N_dim, K_dim,
+                           NULL, warmup_runs, benchmark_runs);
+
     // Test AVX-512 implementation
     benchmark_gemm_variant("AVX-512 GEMM", avx512_wrapper,
-                          A, B, bias, C_avx512, M_dim, N_dim, K_dim, 
-                          C_naive, warmup_runs, benchmark_runs);
-    
-    // Test blocked implementation  
+                           A, B, bias, C_avx512, M_dim, N_dim, K_dim,
+                           C_naive, warmup_runs, benchmark_runs);
+
+    // Test blocked implementation
     benchmark_gemm_variant("Blocked AVX-512 GEMM", blocked_wrapper,
-                          A, B, bias, C_blocked, M_dim, N_dim, K_dim, 
-                          C_naive, warmup_runs, benchmark_runs);
-    
+                           A, B, bias, C_blocked, M_dim, N_dim, K_dim,
+                           C_naive, warmup_runs, benchmark_runs);
+
     printf("\n📈 Performance Summary:\n");
     printf("  Naive implementation provides baseline correctness\n");
     printf("  AVX-512 should show ~8-16x speedup (if memory-bound)\n");
     printf("  Blocked version should show better cache efficiency\n");
-    
+
     // DON'T modify M->total_floats since we used existing memory
 }
 
@@ -637,7 +643,7 @@ int main(int argc, char **argv)
         {"ctx", required_argument, 0, 't'},
         {"vocab", required_argument, 0, 'v'},
         {"force", no_argument, 0, 'f'},
-        {"benchmark", no_argument, 0, 'b'}, 
+        {"benchmark", no_argument, 0, 'b'},
         {0, 0, 0, 0}};
     int c;
     while ((c = getopt_long(argc, argv, "l:d:t:v:f:b", long_opts, NULL)) != -1)
