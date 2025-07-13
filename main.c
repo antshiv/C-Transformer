@@ -404,6 +404,61 @@ void gemm_1d_blocked(float *A, float *B, float *bias, float *C, int M, int N, in
     }
 }
 
+// Blocked GEMM for better cache locality
+void gemm_1d_blocked_per_core(float *A, float *B, float *bias, float *C, int M, int N, int K)
+{
+    const int block_size = 64; // Tune based on cache size
+
+    // Initialize C with bias
+    for (int i = 0; i < M; i++)
+    {
+        for (int j = 0; j < N; j++)
+        {
+            C[i * N + j] = bias[j];
+        }
+    }
+
+    // Blocked multiplication
+    for (int ii = 0; ii < M; ii += block_size)
+    {
+        for (int jj = 0; jj < N; jj += block_size)
+        {
+            for (int kk = 0; kk < K; kk += block_size)
+            {
+
+                int i_end = (ii + block_size < M) ? ii + block_size : M;
+                int j_end = (jj + block_size < N) ? jj + block_size : N;
+                int k_end = (kk + block_size < K) ? kk + block_size : K;
+
+                for (int i = ii; i < i_end; i++)
+                {
+                    for (int j = jj; j < j_end; j++)
+                    {
+                        __m512 sum_vec = _mm512_setzero_ps();
+                        int k;
+
+                        for (k = kk; k <= k_end - 16; k += 16)
+                        {
+                            __m512 a_vec = _mm512_load_ps(&A[i * K + k]);
+                            __m512 b_vec = _mm512_load_ps(&B[j * K + k]);
+                            sum_vec = _mm512_fmadd_ps(a_vec, b_vec, sum_vec);
+                        }
+
+                        float partial_sum = _mm512_reduce_add_ps(sum_vec);
+
+                        for (; k < k_end; k++)
+                        {
+                            partial_sum += A[i * K + k] * B[j * K + k];
+                        }
+
+                        C[i * N + j] += partial_sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Performance statistics structure
 typedef struct
 {
@@ -864,7 +919,17 @@ void benchmark_token_parallel_orchestration(TransformerModel *M, int track_per_t
         setup_core_streams(M, core_id, metrics);
 
         // Process this core's assigned tokens
-        core_token_gemm(metrics, M->embed_dim, 3 * M->embed_dim, track_per_token);
+        // core_token_gemm(metrics, M->embed_dim, 3 * M->embed_dim, track_per_token);
+        // Replace the slow kernel with your fast one.
+        gemm_1d_blocked_per_core(
+            metrics->input_stream,    // A = This core's slice of tokens (e.g., [22 x 8192])
+            metrics->weights_stream,  // B = The shared full weights matrix
+            metrics->bias_stream,     // The shared bias vector
+            metrics->output_stream,   // C = This core's output buffer
+            metrics->tokens_assigned, // M = Number of tokens for this core (~22)
+            3 * M->embed_dim,         // N = Output dimension (24576)
+            M->embed_dim              // K = Inner dimension (8192)
+        );
     }
 
     double total_end = get_time_sec();
