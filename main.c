@@ -23,6 +23,13 @@
 #include <sys/time.h>
 #include <omp.h>
 
+#define ALIGN_UP(n, a) (((n) + (a)-1) & ~((a)-1))
+
+#define ALLOCATE_ALIGNED(ptr, type, count) \
+    posix_memalign((void**)&(ptr), CACHE_ALIGN, sizeof(type) * (count))
+
+#define min(a,b) ((a)<(b)?(a):(b))
+
 /* ─── alignment targets ───────────────────────────────────────────── */
 #define CACHE_ALIGN 64ULL
 #define HUGE_ALIGN (2ULL * 1024 * 1024) /* 2 MB huge page */
