@@ -155,11 +155,10 @@ static size_t bytes_needed(int layers, int vocab, int d_model, int ctx, int for_
     return total_floats * sizeof(float);
 }
 
-// ============================================================================
+// ================================================================
 //  GEMM KERNELS
-// ============================================================================
+// ================================================================
 
-// KERNEL 1: Naive Parallel GEMM (Baseline)
 void gemm_naive_parallel(float *A, float *B, float *bias, float *C, int M, int N, int K) {
     #pragma omp parallel for
     for (int i = 0; i < M; i++) {
@@ -173,7 +172,6 @@ void gemm_naive_parallel(float *A, float *B, float *bias, float *C, int M, int N
     }
 }
 
-// KERNEL 2: Simple AVX-512 Parallel GEMM
 void gemm_avx512_parallel(float *A, float *B, float *bias, float *C, int M, int N, int K) {
     #pragma omp parallel for
     for (int i = 0; i < M; i++) {
@@ -194,7 +192,6 @@ void gemm_avx512_parallel(float *A, float *B, float *bias, float *C, int M, int 
     }
 }
 
-// KERNEL 3: Fine-Grained Parallel Blocked GEMM
 void gemm_fine_grained_parallel(float *A, float *B, float *bias, float *C, int M, int N, int K) {
     const int block_size = 64;
     #pragma omp parallel for
@@ -208,9 +205,10 @@ void gemm_fine_grained_parallel(float *A, float *B, float *bias, float *C, int M
     for (int ii = 0; ii < M; ii += block_size) {
         for (int jj = 0; jj < N; jj += block_size) {
             for (int kk = 0; kk < K; kk += block_size) {
-                int i_end = (ii + block_size < M) ? ii + block_size : M;
-                int j_end = (jj + block_size < N) ? jj + block_size : N;
-                int k_end = (kk + block_size < K) ? kk + block_size : K;
+                int i_end = min(ii + block_size, M);
+                int j_end = min(jj + block_size, N);
+                int k_end = min(kk + block_size, K);
+
                 for (int i = ii; i < i_end; i++) {
                     for (int j = jj; j < j_end; j++) {
                         __m512 sum_vec = _mm512_setzero_ps();
@@ -232,7 +230,6 @@ void gemm_fine_grained_parallel(float *A, float *B, float *bias, float *C, int M
     }
 }
 
-// KERNEL 4: Serial Blocked GEMM (for Token-Parallel Orchestrator)
 void gemm_blocked_serial(float *A, float *B, float *bias, float *C, int M, int N, int K) {
     const int block_size = 64;
     for (int i = 0; i < M; i++) {
@@ -243,9 +240,10 @@ void gemm_blocked_serial(float *A, float *B, float *bias, float *C, int M, int N
     for (int ii = 0; ii < M; ii += block_size) {
         for (int jj = 0; jj < N; jj += block_size) {
             for (int kk = 0; kk < K; kk += block_size) {
-                int i_end = (ii + block_size < M) ? ii + block_size : M;
-                int j_end = (jj + block_size < N) ? jj + block_size : N;
-                int k_end = (kk + block_size < K) ? kk + block_size : K;
+                int i_end = min(ii + block_size, M);
+                int j_end = min(jj + block_size, N);
+                int k_end = min(kk + block_size, K);
+
                 for (int i = ii; i < i_end; i++) {
                     for (int j = jj; j < j_end; j++) {
                         __m512 sum_vec = _mm512_setzero_ps();
