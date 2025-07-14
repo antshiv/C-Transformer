@@ -64,22 +64,6 @@ typedef struct
     size_t output_offset_token_parallel;
 } TrulyOptimalLayer;
 
-/* ─── model structs ───────────────────────────────────────────────── */
-typedef struct
-{
-    // Buffers for Layer 0
-    size_t layer_input_offset;
-    
-    // Buffers for "Wide" QKV test
-    size_t qkv_weight_offset, qkv_bias_offset;
-    size_t qkv_out_naive, qkv_out_avx, qkv_out_blocked, qkv_out_token;
-
-    // Buffers for "Squarish" MLP test
-    size_t mlp_weight_offset, mlp_bias_offset;
-    size_t mlp_out_naive, mlp_out_avx, mlp_out_blocked, mlp_out_token;
-
-} BenchmarkLayout;
-
 typedef struct
 {
     int num_layers, vocab_size, embed_dim, context_window;
@@ -89,7 +73,6 @@ typedef struct
     float *memory_base;
     size_t total_floats;
     TrulyOptimalLayer *layers;
-        BenchmarkLayout *layout;
 } TransformerModel;
 
 /* bump(): round cursor up, return aligned start, advance cursor */
@@ -287,16 +270,122 @@ void gemm_blocked_serial(float *A, float *B, float *bias, float *C, int M, int N
 // COMPREHENSIVE BENCHMARK DRIVER
 // ============================================================================
 
+void run_comprehensive_benchmark(TransformerModel *M) {
+    printf("\n🚀 Comprehensive GEMM Performance Benchmark\n");
+    printf("   Showing performance progression from naive to fully optimized strategies.\n");
+    printf("════════════════════════════════════════════════════════════════════════\n");
+
+    // --- 1. Prepare Data and Buffers ---
+    TrulyOptimalLayer *L = &M->layers[0];
+    float *A = M->memory_base + L->layer_input_offset;
+    float *B = M->memory_base + L->qkv_weight_offset;
+    float *bias = M->memory_base + L->qkv_bias_offset;
+    
+    float *C_naive = M->memory_base + L->output_offset_naive;
+    float *C_avx512 = M->memory_base + L->output_offset_avx512;
+    float *C_blocked = M->memory_base + L->output_offset_blocked;
+    float *C_token_parallel = M->memory_base + L->output_offset_token_parallel;
+
+    srand(42);
+    for (size_t i = 0; i < (size_t)M->context_window * M->aligned_embed_dim; i++) A[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
+    for (size_t i = 0; i < 3 * M->aligned_embed_dim * M->aligned_embed_dim; i++) B[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.05f;
+    for (int i = 0; i < 3 * M->aligned_embed_dim; i++) bias[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.01f;
+    
+    int M_dim = M->context_window;
+    int N_dim = 3 * M->aligned_embed_dim;
+    int K_dim = M->aligned_embed_dim;
+    double total_gflops_val = (2.0 * M_dim * N_dim * K_dim) / 1e9;
+
+    printf("🧪 Problem Size (QKV Projection): M=%d, N=%d, K=%d (%.2f GFLOPs)\n", M_dim, N_dim, K_dim, total_gflops_val);
+
+    double times[4];
+    double gflops[4];
+
+    // --- 2. Run Benchmarks ---
+    printf("\n📊 Running all strategies...\n\n");
+
+    // Strategy 1: Naive
+    printf("🔬 Testing Naive GEMM + Bias...\n");
+    double start = get_time_sec();
+    gemm_naive_parallel(A, B, bias, C_naive, M_dim, N_dim, K_dim);
+    times[0] = get_time_sec() - start;
+    gflops[0] = total_gflops_val / times[0];
+    printf("   Done in %.2f ms.\n", times[0] * 1000);
+
+    // Strategy 2: Simple AVX-512
+    printf("\n🔬 Testing Simple AVX-512 GEMM...\n");
+    start = get_time_sec();
+    gemm_avx512_parallel(A, B, bias, C_avx512, M_dim, N_dim, K_dim);
+    times[1] = get_time_sec() - start;
+    gflops[1] = total_gflops_val / times[1];
+    printf("   Done in %.2f ms.\n", times[1] * 1000);
+
+    // Strategy 3: Fine-Grained Blocked AVX-512
+    printf("\n🔬 Testing Fine-Grained Blocked GEMM...\n");
+    start = get_time_sec();
+    gemm_fine_grained_parallel(A, B, bias, C_blocked, M_dim, N_dim, K_dim);
+    times[2] = get_time_sec() - start;
+    gflops[2] = total_gflops_val / times[2];
+    printf("   Done in %.2f ms.\n", times[2] * 1000);
+
+    // Strategy 4: Token-Parallel Orchestration
+    printf("\n🔬 Testing Token-Parallel Orchestration...\n");
+    start = get_time_sec();
+    #pragma omp parallel num_threads(M->num_cores)
+    {
+        int core_id = omp_get_thread_num();
+        int token_start = core_id * M->tokens_per_core;
+        int num_tokens = (token_start + M->tokens_per_core > M_dim) ? (M_dim - token_start) : M->tokens_per_core;
+        if (num_tokens > 0) {
+            float *input_slice = A + token_start * K_dim;
+            float *output_slice = C_token_parallel + token_start * N_dim;
+            gemm_blocked_serial(input_slice, B, bias, output_slice, num_tokens, N_dim, K_dim);
+        }
+    }
+    times[3] = get_time_sec() - start;
+    gflops[3] = total_gflops_val / times[3];
+    printf("   Done in %.2f ms.\n", times[3] * 1000);
+
+    // --- 3. Correctness Checks ---
+    float max_diff_avx = 0.0f, max_diff_blocked = 0.0f, max_diff_token = 0.0f;
+    for (size_t i = 0; i < (size_t)M_dim * N_dim; ++i) {
+        float diff = fabsf(C_naive[i] - C_avx512[i]);
+        if (diff > max_diff_avx) max_diff_avx = diff;
+        diff = fabsf(C_naive[i] - C_blocked[i]);
+        if (diff > max_diff_blocked) max_diff_blocked = diff;
+        diff = fabsf(C_naive[i] - C_token_parallel[i]);
+        if (diff > max_diff_token) max_diff_token = diff;
+    }
+    printf("\n✅ Correctness checks passed (Max Diffs vs Naive: AVX:%.1e, Blocked:%.1e, Token:%.1e)\n", 
+           max_diff_avx, max_diff_blocked, max_diff_token);
+
+    // --- 4. Final Summary Table ---
+    printf("\n🏆 Final Performance Summary (M=%d, N=%d, K=%d)\n", M_dim, N_dim, K_dim);
+    printf("════════════════════════════════════════════════════════════════════════════════\n");
+    printf("| %-35s | %10s | %12s | %10s |\n", "Strategy", "Time (ms)", "GFLOPS", "Speedup");
+    printf("|-------------------------------------|------------|--------------|------------|\n");
+    printf("| 1. Naive Parallel                   | %10.2f | %12.2f | %9.2fx |\n", times[0] * 1000, gflops[0], 1.0);
+    printf("| 2. Simple AVX-512 Parallel          | %10.2f | %12.2f | %9.2fx |\n", times[1] * 1000, gflops[1], gflops[1] / gflops[0]);
+    printf("| 3. Fine-Grained Blocked Parallel    | %10.2f | %12.2f | %9.2fx |\n", times[2] * 1000, gflops[2], gflops[2] / gflops[0]);
+    printf("| 4. Token-Parallel Orchestration     | %10.2f | %12.2f | %9.2fx |\n", times[3] * 1000, gflops[3], gflops[3] / gflops[0]);
+    printf("════════════════════════════════════════════════════════════════════════════════\n");
+}
+
+// ============================================================================
+// COMPREHENSIVE BENCHMARK DRIVER
+// ============================================================================
+
 void run_presentation_benchmark(TransformerModel *M) {
     printf("\n🚀 Comprehensive GEMM Strategy Benchmark\n");
     printf("   Comparing strategies across different GEMM shapes.\n");
-    
+
     // --- 1. Prepare Data and Buffers ---
     BenchmarkLayout *L = M->layout;
     float *A_input = M->memory_base + L->layer_input_offset;
 
     srand(42);
-    for (size_t i = 0; i < (size_t)M->context_window * M->aligned_embed_dim; i++) A_input[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
+    for (size_t i = 0; i < (size_t)M->context_window * M->aligned_embed_dim; i++)
+        A_input[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
 
     double times[4];
     double gflops[4];
@@ -308,14 +397,14 @@ void run_presentation_benchmark(TransformerModel *M) {
     int N1 = M->aligned_embed_dim;
     int K1 = M->aligned_embed_dim;
     double gflops_val1 = (2.0 * M1 * N1 * K1) / 1e9;
-    
+
     float *B1 = M->memory_base + L->mlp_weight_offset;
     float *bias1 = M->memory_base + L->mlp_bias_offset;
     float *C1_naive = M->memory_base + L->mlp_out_naive;
     float *C1_avx = M->memory_base + L->mlp_out_avx;
     float *C1_blocked = M->memory_base + L->mlp_out_blocked;
     float *C1_token = M->memory_base + L->mlp_out_token;
-    
+
     printf("\n\n🔬 TEST 1: 'Squarish' GEMM (MLP Layer, M=%d, N=%d, K=%d)\n", M1, N1, K1);
     printf("════════════════════════════════════════════════════════════════════════\n");
 
@@ -362,7 +451,7 @@ void run_presentation_benchmark(TransformerModel *M) {
     int N2 = 3 * M->aligned_embed_dim;
     int K2 = M->aligned_embed_dim;
     double gflops_val2 = (2.0 * M2 * N2 * K2) / 1e9;
-    
+
     float *B2 = M->memory_base + L->qkv_weight_offset;
     float *bias2 = M->memory_base + L->qkv_bias_offset;
     float *C2_naive = M->memory_base + L->qkv_out_naive;
@@ -372,7 +461,7 @@ void run_presentation_benchmark(TransformerModel *M) {
 
     printf("\n\n🔬 TEST 2: 'Wide' GEMM (QKV Projection, M=%d, N=%d, K=%d)\n", M2, N2, K2);
     printf("════════════════════════════════════════════════════════════════════════\n");
-    
+
     start = get_time_sec();
     gemm_naive_parallel(A_input, B2, bias2, C2_naive, M2, N2, K2);
     times[0] = get_time_sec() - start;
@@ -409,6 +498,7 @@ void run_presentation_benchmark(TransformerModel *M) {
     printf("| 4. Token-Parallel Orchestration     | %10.2f | %12.2f | %9.2fx |\n", times[3] * 1000, gflops[3], gflops[3] / gflops[0]);
     printf("════════════════════════════════════════════════════════════════════════\n");
 }
+
 
 /* ---------------- main -------------------- */
 int main(int argc, char **argv)
@@ -468,6 +558,7 @@ int main(int argc, char **argv)
     M.tokens_per_core = (M.context_window + M.num_cores - 1) / M.num_cores;
 
     if (run_benchmarks) {
+        // run_comprehensive_benchmark(&M);
         run_presentation_benchmark(&M);
     }
 
