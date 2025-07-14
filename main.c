@@ -64,6 +64,22 @@ typedef struct
     size_t output_offset_token_parallel;
 } TrulyOptimalLayer;
 
+/* ─── model structs ───────────────────────────────────────────────── */
+typedef struct
+{
+    // Buffers for Layer 0
+    size_t layer_input_offset;
+    
+    // Buffers for "Wide" QKV test
+    size_t qkv_weight_offset, qkv_bias_offset;
+    size_t qkv_out_naive, qkv_out_avx, qkv_out_blocked, qkv_out_token;
+
+    // Buffers for "Squarish" MLP test
+    size_t mlp_weight_offset, mlp_bias_offset;
+    size_t mlp_out_naive, mlp_out_avx, mlp_out_blocked, mlp_out_token;
+
+} BenchmarkLayout;
+
 typedef struct
 {
     int num_layers, vocab_size, embed_dim, context_window;
@@ -73,6 +89,7 @@ typedef struct
     float *memory_base;
     size_t total_floats;
     TrulyOptimalLayer *layers;
+        BenchmarkLayout *layout;
 } TransformerModel;
 
 /* bump(): round cursor up, return aligned start, advance cursor */
@@ -266,8 +283,6 @@ void gemm_blocked_serial(float *A, float *B, float *bias, float *C, int M, int N
     }
 }
 
-// ============================================================================
-// COMPREHENSIVE BENCHMARK DRIVER
 // ============================================================================
 // COMPREHENSIVE BENCHMARK DRIVER
 // ============================================================================
