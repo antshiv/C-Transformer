@@ -468,7 +468,7 @@ int main(int argc, char **argv)
     M.tokens_per_core = (M.context_window + M.num_cores - 1) / M.num_cores;
 
     if (run_benchmarks) {
-        run_comprehensive_benchmark(&M);
+        run_presentation_benchmark(&M);
     }
 
     destroy_transformer(&M);
