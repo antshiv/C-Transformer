@@ -1,14 +1,24 @@
 /***********************************************************************
- * INTEGRATED MEMORY-OPTIMIZED TRANSFORMER BENCHMARK (PURE C)
+ * CPU-OPTIMIZED LARGE LANGUAGE MODEL (LLM) RUNTIME (PURE C)
  * ---------------------------------------------------------------
- * • Uses clean bump allocation system for optimal memory layout
- * • Tests all GEMM kernels using different layers' allocated memory
- * • Each layer tests a different kernel (agnostic to LLM algorithm)
- * • No kernel-specific offsets in layer structure
- * • Minimum 4 layers required for comprehensive testing
- * • All data (inputs, weights, outputs) are within the model's single allocated block
- * • Correctness comparison uses Layer 0's Naive output as reference, ensuring consistent inputs via memcpy
- * • No artificial temporary buffers - only realistic memory operations
+ * This project focuses on building a high-performance LLM runtime from
+ * first principles in C, engineered for modern CPU architectures to excel
+ * at both inference and eventual training capabilities.
+ *
+ * Key Design Principles & Optimization Pillars:
+ * • Optimal Memory Layout: Utilizes a single, contiguous, 64-byte-aligned
+ * memory arena with 2 MB Huge Pages and bump allocation for zero fragmentation.
+ * • Hardware-Aware Optimization: Leverages advanced CPU features like
+ * AVX-512, with a roadmap to explore AMX, DSA, and NUMA-aware worker pools.
+ * • Comprehensive Toolchain: Integrates profiling (VTune) and compilers
+ * (Intel oneAPI HPC Toolkit) for deep performance analysis.
+ *
+ * Integrated Benchmarking for Optimization:
+ * • Benchmarks are a critical tool to quantify performance improvements
+ * and validate optimization strategies across the runtime.
+ * • They test core operations (e.g., GEMM kernels) on realistic LLM layer
+ * shapes using a dedicated, consistent methodology within the allocated
+ * model memory, ensuring transparent and reproducible results.
  ***********************************************************************/
 
 #define _GNU_SOURCE
@@ -179,6 +189,52 @@ static size_t bytes_needed(int layers, int vocab, int d_model, int ctx) {
 
     size_t total_floats = embedding_size + ((size_t)layers * per_layer_floats) + final_ln_size;
     return total_floats * sizeof(float);
+}
+
+/***********************************************************************
+ *  SLICE HELPERS: Access aligned memory slices for core and head
+ *  ---------------------------------------------------------------
+ *  - get_slice()           → token-parallel access for core-local compute
+ *  - get_slice_and_len()   → same as get_slice + token count (loop bound)
+ *  - get_head_slice()      → head-parallel access inside attention layers
+ ***********************************************************************/
+
+/* Return pointer to core-local slice of vectorized data */
+static inline float *get_slice(TransformerModel *M, int core_id,
+                               size_t base_offset, size_t vector_dim)
+{
+    size_t token_start = core_id * M->tokens_per_core;
+    if (token_start >= M->context_window) return NULL;  // bounds-safe
+    return M->memory_base + base_offset + token_start * vector_dim;
+}
+
+/* Return pointer and number of tokens this core owns */
+static inline float *get_slice_and_len(TransformerModel *M, int core_id,
+                                       size_t base_offset, size_t vector_dim,
+                                       size_t *out_tokens)
+{
+    size_t t0 = core_id * M->tokens_per_core;
+    size_t t1 = (core_id + 1) * M->tokens_per_core;
+    if (t0 >= M->context_window) return NULL;
+    if (t1 > M->context_window) t1 = M->context_window;
+    *out_tokens = t1 - t0;
+    return M->memory_base + base_offset + t0 * vector_dim;
+}
+
+/* Return pointer to head-local slice for a token block */
+static inline float *get_head_slice(
+    TransformerModel *M,
+    size_t base_offset,
+    int head_id,
+    int total_heads,
+    int token_start,
+    int token_count)
+{
+    size_t head_dim = M->embed_dim / total_heads;
+    size_t offset = base_offset
+                  + token_start * total_heads * head_dim  // full rows
+                  + head_id * head_dim;                   // head offset
+    return M->memory_base + offset;
 }
 
 // ================================================================
