@@ -934,6 +934,326 @@ void gelu_activation_token_parallel(TransformerModel *M, size_t data_offset)
     }
 }
 
+// ============================================================================
+// QKV PROJECTION (Using your optimized GEMM)
+// ============================================================================
+void qkv_projection_token_parallel(TransformerModel *M,
+                                   size_t input_offset,
+                                   size_t qkv_weight_offset,
+                                   size_t qkv_bias_offset,
+                                   size_t qkv_output_offset)
+{
+#pragma omp parallel num_threads(M->num_cores)
+    {
+        int core_id = omp_get_thread_num();
+        int token_start = core_id * M->tokens_per_core;
+        int num_tokens = (token_start + M->tokens_per_core > M->context_window)
+                             ? (M->context_window - token_start)
+                             : M->tokens_per_core;
+
+        if (num_tokens > 0)
+        {
+            const float *A_input = M->memory_base + input_offset + token_start * M->aligned_embed_dim;
+            const float *B_weights = M->memory_base + qkv_weight_offset;
+            const float *bias = M->memory_base + qkv_bias_offset;
+            float *C_out = M->memory_base + qkv_output_offset + token_start * 3 * M->aligned_embed_dim;
+
+            // Use your optimized blocked serial GEMM for QKV projection
+            gemm_blocked_serial(A_input, B_weights, bias, C_out,
+                                num_tokens, 3 * M->aligned_embed_dim, M->aligned_embed_dim);
+        }
+    }
+}
+
+// ================================================================
+// SOFTMAX (Numerically Stable)
+// ================================================================
+void softmax_inplace(float *x, int n)
+{
+    // Find max for numerical stability
+    float max_val = x[0];
+    for (int i = 1; i < n; i++)
+    {
+        if (x[i] > max_val)
+            max_val = x[i];
+    }
+
+    // Compute exp(x - max) and sum
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++)
+    {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+
+    // Normalize
+    float inv_sum = 1.0f / sum;
+    for (int i = 0; i < n; i++)
+    {
+        x[i] *= inv_sum;
+    }
+}
+
+// Helper function for single attention head computation
+void attention_head_compute(const float *Q, const float *K, const float *V, float *output,
+                            int num_tokens, int seq_len, int head_dim, float scale, int stride)
+{
+    // Temporary scores buffer (could be optimized to use model memory)
+    // IMPORTANT: This malloc is per-thread and should be replaced with pre-allocated
+    // memory from the model's arena for true HPC optimization and to avoid repeated allocations.
+    float *scores = (float *)malloc(num_tokens * seq_len * sizeof(float));
+    if (!scores)
+    {
+        perror("malloc scores");
+        exit(EXIT_FAILURE);
+    }
+
+    // Q × K^T (scaled)
+    for (int i = 0; i < num_tokens; i++)
+    {
+        for (int j = 0; j < seq_len; j++)
+        {
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; d++)
+            {
+                score += Q[i * stride + d] * K[j * stride + d];
+            }
+            scores[i * seq_len + j] = score * scale;
+        }
+    }
+
+    // Softmax over scores
+    for (int i = 0; i < num_tokens; i++)
+    {
+        float *row = scores + i * seq_len;
+        softmax_inplace(row, seq_len);
+    }
+
+    // Scores × V
+    for (int i = 0; i < num_tokens; i++)
+    {
+        for (int d = 0; d < head_dim; d++)
+        {
+            float sum = 0.0f;
+            for (int j = 0; j < seq_len; j++)
+            {
+                sum += scores[i * seq_len + j] * V[j * stride + d];
+            }
+            output[i * stride + d] = sum;
+        }
+    }
+
+    free(scores); // Free temporary buffer
+}
+
+// ================================================================
+// ATTENTION COMPUTATION (Scaled Dot-Product)
+// ================================================================
+void attention_compute_token_parallel(TransformerModel *M,
+                                      size_t qkv_output_offset,
+                                      size_t attention_output_offset)
+{
+    const int head_dim = M->aligned_embed_dim / M->num_attention_heads;
+    const float scale = 1.0f / sqrtf((float)head_dim);
+
+#pragma omp parallel num_threads(M->num_cores)
+    {
+        int core_id = omp_get_thread_num();
+        int token_start = core_id * M->tokens_per_core;
+        int num_tokens = (token_start + M->tokens_per_core > M->context_window)
+                             ? (M->context_window - token_start)
+                             : M->tokens_per_core;
+
+        if (num_tokens > 0)
+        {
+            for (int h = 0; h < M->num_attention_heads; h++)
+            {
+                // Extract Q, K, V for this head
+                // Q is token-sliced, K and V are global (full context window)
+                const float *Q = M->memory_base + qkv_output_offset +
+                                 token_start * 3 * M->aligned_embed_dim + h * head_dim;
+                // K and V need to be accessed globally for attention over the full sequence
+                const float *K = M->memory_base + qkv_output_offset +
+                                 M->aligned_embed_dim + h * head_dim;
+                const float *V = M->memory_base + qkv_output_offset +
+                                 2 * M->aligned_embed_dim + h * head_dim;
+
+                float *output = M->memory_base + attention_output_offset +
+                                token_start * M->aligned_embed_dim + h * head_dim;
+
+                // Compute attention for this head's token slice
+                attention_head_compute(Q, K, V, output, num_tokens, M->context_window,
+                                       head_dim, scale, M->aligned_embed_dim);
+            }
+        }
+    }
+}
+
+// ================================================================
+// ATTENTION PROJECTION (Output projection)
+// ================================================================
+void attention_projection_token_parallel(TransformerModel *M,
+                                         size_t attention_output_offset,
+                                         size_t proj_weight_offset,
+                                         size_t proj_bias_offset,
+                                         size_t final_output_offset)
+{
+#pragma omp parallel num_threads(M->num_cores)
+    {
+        int core_id = omp_get_thread_num();
+        int token_start = core_id * M->tokens_per_core;
+        int num_tokens = (token_start + M->tokens_per_core > M->context_window)
+                             ? (M->context_window - token_start)
+                             : M->tokens_per_core;
+
+        if (num_tokens > 0)
+        {
+            const float *A_input = M->memory_base + attention_output_offset + token_start * M->aligned_embed_dim;
+            const float *B_weights = M->memory_base + proj_weight_offset;
+            const float *bias = M->memory_base + proj_bias_offset;
+            float *C_out = M->memory_base + final_output_offset + token_start * M->aligned_embed_dim;
+
+            gemm_blocked_serial(A_input, B_weights, bias, C_out,
+                                num_tokens, M->aligned_embed_dim, M->aligned_embed_dim);
+        }
+    }
+}
+
+// ================================================================
+// RESIDUAL CONNECTION (Element-wise Add)
+// ================================================================
+void residual_add_token_parallel(TransformerModel *M,
+                                 size_t input_offset,
+                                 size_t residual_offset,
+                                 size_t output_offset)
+{
+#pragma omp parallel num_threads(M->num_cores)
+    {
+        int core_id = omp_get_thread_num();
+        size_t token_start = core_id * M->tokens_per_core;
+        size_t num_tokens = (token_start + M->tokens_per_core > M->context_window)
+                                ? (M->context_window - token_start)
+                                : M->tokens_per_core;
+
+        if (num_tokens > 0)
+        {
+            const float *input = M->memory_base + input_offset + token_start * M->aligned_embed_dim;
+            const float *residual = M->memory_base + residual_offset + token_start * M->aligned_embed_dim;
+            float *output = M->memory_base + output_offset + token_start * M->aligned_embed_dim;
+
+            size_t total_elements = num_tokens * M->aligned_embed_dim;
+
+            // Vectorized addition
+            size_t i = 0;
+            for (; i <= total_elements - 16; i += 16)
+            {
+                __m512 a = _mm512_load_ps(input + i);
+                __m512 b = _mm512_load_ps(residual + i);
+                __m512 result = _mm512_add_ps(a, b);
+                _mm512_store_ps(output + i, result);
+            }
+
+            // Handle remainder
+            for (; i < total_elements; i++)
+            {
+                output[i] = input[i] + residual[i];
+            }
+        }
+    }
+}
+
+// ================================================================
+// GELU ACTIVATION (Fast approximation)
+// ================================================================
+void gelu_activation_token_parallel(TransformerModel *M, size_t data_offset)
+{
+#pragma omp parallel num_threads(M->num_cores)
+    {
+        int core_id = omp_get_thread_num();
+        size_t token_start = core_id * M->tokens_per_core;
+        size_t num_tokens = (token_start + M->tokens_per_core > M->context_window)
+                                ? (M->context_window - token_start)
+                                : M->tokens_per_core;
+
+        if (num_tokens > 0)
+        {
+            // GELU is applied after FC1, which expands to 4*aligned_embed_dim
+            float *data = M->memory_base + data_offset + token_start * 4 * M->aligned_embed_dim;
+            size_t total_elements = num_tokens * 4 * M->aligned_embed_dim;
+
+            // Fast GELU approximation: x * 0.5 * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+            const float sqrt_2_over_pi = 0.7978845608f;
+            const float coeff = 0.044715f;
+
+            for (size_t i = 0; i < total_elements; i++)
+            {
+                float x = data[i];
+                float x3 = x * x * x;
+                float inner = sqrt_2_over_pi * (x + coeff * x3);
+                data[i] = 0.5f * x * (1.0f + tanhf(inner));
+            }
+        }
+    }
+}
+
+// ================================================================
+// MLP (Feed-Forward Network) - Two GEMM operations
+// ================================================================
+void mlp_token_parallel(TransformerModel *M,
+                        size_t input_offset,
+                        size_t fc1_weight_offset,
+                        size_t fc1_bias_offset,
+                        size_t fc1_output_offset,
+                        size_t fc2_weight_offset,
+                        size_t fc2_bias_offset,
+                        size_t output_offset)
+{
+    // FC1: expand to 4x dimension
+#pragma omp parallel num_threads(M->num_cores)
+    {
+        int core_id = omp_get_thread_num();
+        int token_start = core_id * M->tokens_per_core;
+        int num_tokens = (token_start + M->tokens_per_core > M->context_window)
+                             ? (M->context_window - token_start)
+                             : M->tokens_per_core;
+
+        if (num_tokens > 0)
+        {
+            const float *A_input = M->memory_base + input_offset + token_start * M->aligned_embed_dim;
+            const float *B_weights = M->memory_base + fc1_weight_offset;
+            const float *bias = M->memory_base + fc1_bias_offset;
+            float *C_out = M->memory_base + fc1_output_offset + token_start * 4 * M->aligned_embed_dim;
+
+            gemm_blocked_serial(A_input, B_weights, bias, C_out,
+                                num_tokens, 4 * M->aligned_embed_dim, M->aligned_embed_dim);
+        }
+    }
+
+    // Apply GELU activation in-place
+    gelu_activation_token_parallel(M, fc1_output_offset);
+
+    // FC2: project back to original dimension
+#pragma omp parallel num_threads(M->num_cores)
+    {
+        int core_id = omp_get_thread_num();
+        int token_start = core_id * M->tokens_per_core;
+        int num_tokens = (token_start + M->tokens_per_core > M->context_window)
+                             ? (M->context_window - token_start)
+                             : M->tokens_per_core;
+
+        if (num_tokens > 0)
+        {
+            const float *A_input = M->memory_base + fc1_output_offset + token_start * 4 * M->aligned_embed_dim;
+            const float *B_weights = M->memory_base + fc2_weight_offset;
+            const float *bias = M->memory_base + fc2_bias_offset;
+            float *C_out = M->memory_base + output_offset + token_start * M->aligned_embed_dim;
+
+            gemm_blocked_serial(A_input, B_weights, bias, C_out,
+                                num_tokens, M->aligned_embed_dim, 4 * M->aligned_embed_dim);
+        }
+    }
+}
+
 // ================================================================
 // COMPLETE TRANSFORMER LAYER
 // ================================================================
@@ -942,9 +1262,10 @@ void transformer_layer_forward(TransformerModel *M, int layer_idx, size_t layer_
     TrulyOptimalLayer *L = &M->layers[layer_idx];
     const float eps = 1e-5f;
 
-    // 1. Pre-attention LayerNorm
+     // 1. Pre-attention LayerNorm
     layernorm_token_parallel(M, layer_input_offset, L->ln1_weight_offset,
-                             L->ln1_bias_offset, L->ln1_output_offset, eps);
+                             L->ln1_bias_offset, L->ln1_mean_offset, L->ln1_rstd_offset, L->ln1_output_offset, eps);
+                         
 
     // 2. QKV Projection
     qkv_projection_token_parallel(M, L->ln1_output_offset, L->qkv_weight_offset,
@@ -963,7 +1284,7 @@ void transformer_layer_forward(TransformerModel *M, int layer_idx, size_t layer_
 
     // 6. Pre-MLP LayerNorm
     layernorm_token_parallel(M, L->residual1_output_offset, L->ln2_weight_offset,
-                             L->ln2_bias_offset, L->ln2_output_offset, eps);
+                             L->ln2_bias_offset, L->ln2_mean_offset, L->ln2_rstd_offset, L->ln2_output_offset, eps);
 
     // 7. MLP (Feed-Forward)
     mlp_token_parallel(M, L->ln2_output_offset, L->fc1_weight_offset, L->fc1_bias_offset,
