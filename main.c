@@ -171,33 +171,46 @@ typedef struct {
 
 typedef struct
 {
+    /* File metadata (from weight file header) */
+    char magic[8];              // "BUMPWGT2"
+    uint32_t version;           // Weight file version
+    uint32_t model_type;        // 0=GPT2, 1=LLAMA, etc.
+    
     /* hyper-parameters */
     int num_layers, vocab_size, embed_dim, context_window;
     size_t aligned_embed_dim;
     size_t aligned_head_dim;
     size_t aligned_attn_context_window;
-
+    
     /* execution plan */
     int num_cores;           // usable compute cores for model
     int tokens_per_core;     // slice of context_window each core owns
     int num_attention_heads; // usually embed_dim / head_dim
     int head_dim;           // embed_dim / num_attention_heads
-
+    
     /* single block */
     float *memory_base;
     size_t total_floats;
     size_t layer_stride;
-
+    
     /* top-level offsets */
     size_t token_emb_offset, pos_emb_offset, embedded_input_offset;
     size_t layers_start_offset;
-
+    
     /* per-layer table */
     TrulyOptimalLayer *layers;
-
+    
     /* final LN */
     size_t final_ln_weight_offset, final_ln_bias_offset;
-    size_t final_ln_mean_offset, final_ln_rstd_offset; // Added for final LN
+    size_t final_ln_mean_offset, final_ln_rstd_offset;
+    size_t final_output_offset;
+    
+    size_t lm_head_weight_offset;
+    size_t logits_offset;
+    
+    /* Weight file metadata */
+    uint8_t checksum[32];       // SHA256 from file
+    uint8_t reserved[32];       // Reserved for future use
 } TransformerModel;
 
 /* bump(): round cursor up, return aligned start, advance cursor */
@@ -347,6 +360,13 @@ void layout_transformer(TransformerModel *M) {
     M->final_ln_bias_offset = bump(&off, aligned_embed_dim, CACHE_ALIGN);
     M->final_ln_mean_offset = bump(&off, (size_t)M->context_window, CACHE_ALIGN);
     M->final_ln_rstd_offset = bump(&off, (size_t)M->context_window, CACHE_ALIGN);
+    
+    M->final_output_offset = bump(&off, (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
+    
+    M->lm_head_weight_offset = M->token_emb_offset;  // WEIGHT TYING
+
+    // Then if you're doing language modeling, you might also want:
+    M->logits_offset = bump(&off, (size_t)M->context_window * M->vocab_size, CACHE_ALIGN);
 
     // The `off` variable now marks the end of the usable model data.
     // We add a final, larger canary zone to the total allocation size.
@@ -538,7 +558,7 @@ void gemm_fine_grained_parallel(const float *A, const float *B, const float *bia
     {
         for (int j = 0; j < N; j++)
         {
-            C[i * N + j] = bias[j];
+            C[i * N + j] = bias ? bias[j] : 0.0f;  // NULL-safe
         }
     }
 #pragma omp parallel for collapse(3)
@@ -2994,6 +3014,46 @@ void benchmark_attention_projection_complete(TransformerModel *M) {
     
     printf("════════════════════════════════════════════════════════════════════════\n");
 }
+
+void add_gpt2_token_and_positional_embeddings(TransformerModel *M, 
+                                              size_t token_ids_offset,  // Where token indices are stored
+                                              size_t output_offset)     // Where combined embeddings go
+{
+    const float *token_embeddings = M->memory_base + M->token_emb_offset;
+    const float *pos_embeddings = M->memory_base + M->pos_emb_offset;
+    float *output_embeddings = M->memory_base + output_offset;
+
+#pragma omp parallel for num_threads(M->num_cores)
+    for (int t = 0; t < M->context_window; t++) {
+        // Assuming token_ids is stored as int32 or uint32
+        const int32_t *token_ids = (int32_t*)(M->memory_base + token_ids_offset);
+        int token_id = token_ids[t];
+
+        // Vectorized addition using AVX-512
+        int dim;
+        for (dim = 0; dim <= M->embed_dim - 16; dim += 16) {
+            __m512 token_vec = _mm512_load_ps(&token_embeddings[token_id * M->aligned_embed_dim + dim]);
+            __m512 pos_vec = _mm512_load_ps(&pos_embeddings[t * M->aligned_embed_dim + dim]);
+            
+            __m512 result = _mm512_add_ps(token_vec, pos_vec);
+            
+            _mm512_store_ps(&output_embeddings[t * M->aligned_embed_dim + dim], result);
+        }
+
+        // Handle any remainder dimensions
+        for (; dim < M->embed_dim; dim++) {
+            output_embeddings[t * M->aligned_embed_dim + dim] = 
+                token_embeddings[token_id * M->aligned_embed_dim + dim] + 
+                pos_embeddings[t * M->aligned_embed_dim + dim];
+        }
+
+        // Zero out padding
+        for (int dim = M->embed_dim; dim < M->aligned_embed_dim; dim++) {
+            output_embeddings[t * M->aligned_embed_dim + dim] = 0.0f;
+        }
+    }
+}
+
 // ============================================================================
 // OPTIMIZED MICRO-KERNEL VERSION (Future Enhancement)
 // ============================================================================
@@ -3141,6 +3201,77 @@ void mlp_token_parallel(TransformerModel *M,
     }
 }
 
+void embed_tokens(TransformerModel *M, int32_t *token_ids, int num_tokens) {
+    // Process tokens up to context window limit
+    int tokens_to_process = (num_tokens < M->context_window) ? num_tokens : M->context_window;
+    
+    for (int t = 0; t < tokens_to_process; t++) {
+        int token_id = token_ids[t];
+        
+        // Bounds check
+        if (token_id < 0 || token_id >= M->vocab_size) {
+            fprintf(stderr, "❌ Invalid token ID %d at position %d (vocab size: %d)\n", 
+                    token_id, t, M->vocab_size);
+            continue;  // Skip or handle error
+        }
+        
+        // Direct indexing - no lookup needed!
+        float *token_emb = M->memory_base + M->token_emb_offset + 
+                          token_id * M->aligned_embed_dim;
+        float *pos_emb = M->memory_base + M->pos_emb_offset + 
+                        t * M->aligned_embed_dim;
+        float *output = M->memory_base + M->embedded_input_offset + 
+                       t * M->aligned_embed_dim;
+        
+        // Vectorized add
+        int i;
+        for (i = 0; i <= M->embed_dim - 16; i += 16) {
+            __m512 tok = _mm512_load_ps(token_emb + i);
+            __m512 pos = _mm512_load_ps(pos_emb + i);
+            __m512 sum = _mm512_add_ps(tok, pos);
+            _mm512_store_ps(output + i, sum);
+        }
+        // Handle remainder
+        for (; i < M->embed_dim; i++) {
+            output[i] = token_emb[i] + pos_emb[i];
+        }
+    }
+    
+    printf("✅ Embedded %d tokens\n", tokens_to_process);
+}
+
+void compute_logits_last_token_optimized(TransformerModel *M, int position) {
+    const float *token_hidden = M->memory_base + M->final_output_offset 
+                               + position * M->aligned_embed_dim;
+    const float *lm_head = M->memory_base + M->lm_head_weight_offset;
+    float *logits = M->memory_base + M->logits_offset 
+                   + position * M->vocab_size;
+    
+    // For each vocab word, compute dot product with hidden state
+    #pragma omp parallel for num_threads(M->num_cores)
+    for (int v = 0; v < M->vocab_size; v++) {
+        const float *weight_row = lm_head + v * M->aligned_embed_dim;
+        
+        // Vectorized dot product
+        __m512 sum_vec = _mm512_setzero_ps();
+        int d;
+        for (d = 0; d <= M->embed_dim - 16; d += 16) {
+            __m512 h = _mm512_load_ps(token_hidden + d);
+            __m512 w = _mm512_load_ps(weight_row + d);
+            sum_vec = _mm512_fmadd_ps(h, w, sum_vec);
+        }
+        
+        float sum = _mm512_reduce_add_ps(sum_vec);
+        
+        // Handle remainder
+        for (; d < M->embed_dim; d++) {
+            sum += token_hidden[d] * weight_row[d];
+        }
+        
+        logits[v] = sum;
+    }
+}
+
 // ================================================================
 // COMPLETE TRANSFORMER LAYER
 // ================================================================
@@ -3183,38 +3314,41 @@ void transformer_layer_forward(TransformerModel *M, int layer_idx, size_t layer_
 // ================================================================
 // FULL FORWARD PASS
 // ================================================================
-void transformer_forward_pass(TransformerModel *M, size_t input_offset)
+
+
+void transformer_forward_pass(TransformerModel *M, size_t input_offset) 
 {
-    // Copy input to first layer
-    size_t current_input = M->layers[0].layer_input_offset;
-    memcpy(M->memory_base + current_input, M->memory_base + input_offset,
-           M->context_window * M->aligned_embed_dim * sizeof(float));
-
-    // Process each layer
-    for (int layer = 0; layer < M->num_layers; layer++)
-    {
-        printf("Processing layer %d/%d...\n", layer + 1, M->num_layers);
-
+    printf("  FWD: Entry\n");
+    fflush(stdout);
+    
+    // This might be the issue!
+    printf("  FWD: Calling add_gpt2_token_and_positional_embeddings\n");
+    fflush(stdout);
+    
+    add_gpt2_token_and_positional_embeddings(M, 
+        input_offset,
+        M->embedded_input_offset
+    );
+    
+    printf("  FWD: Embeddings done\n");
+    fflush(stdout);
+    
+    size_t current_input = M->embedded_input_offset;
+    
+    for (int layer = 0; layer < M->num_layers; layer++) {
+        printf("  FWD: Layer %d starting\n", layer);
+        fflush(stdout);
+        
         transformer_layer_forward(M, layer, current_input);
-
-        // Update input for next layer (output of current layer)
+        
+        printf("  FWD: Layer %d done\n", layer);
+        fflush(stdout);
+        
         current_input = M->layers[layer].residual2_output_offset;
-
-        // Copy to next layer's input if not the last layer
-        if (layer < M->num_layers - 1)
-        {
-            memcpy(M->memory_base + M->layers[layer + 1].layer_input_offset,
-                   M->memory_base + current_input,
-                   M->context_window * M->aligned_embed_dim * sizeof(float));
-        }
     }
-
-    // Final LayerNorm
-    layernorm_token_parallel(M, current_input, M->final_ln_weight_offset,
-                             M->final_ln_bias_offset, M->final_ln_mean_offset, M->final_ln_rstd_offset,
-                             current_input, 1e-5f);
-
-    printf("✅ Forward pass complete! Final output at offset %zu\n", current_input);
+    
+    printf("  FWD: Complete\n");
+    fflush(stdout);
 }
 
 // ============================================================================
@@ -3382,28 +3516,397 @@ void run_comprehensive_benchmark(TransformerModel *M)
     }
 }
 
+/**
+ * @brief Load weights into already-allocated TransformerModel
+ * 
+ * This assumes:
+ * 1. read_model_metadata() has been called
+ * 2. layout_transformer() has been called to allocate memory
+ * 3. You've verified you have enough RAM
+ * 
+ * @param M Pointer to initialized and allocated TransformerModel
+ * @param weight_file Path to the .weights file
+ * @return 0 on success, -1 on failure
+ */
+int load_model_weights(TransformerModel *M, const char* weight_file) {
+    if (M->memory_base == NULL) {
+        fprintf(stderr, "❌ Model memory not allocated. Call layout_transformer() first.\n");
+        return -1;
+    }
+    
+    FILE *fp = fopen(weight_file, "rb");
+    if (!fp) {
+        fprintf(stderr, "❌ Could not open weight file: %s\n", weight_file);
+        return -1;
+    }
+
+    printf("\n📥 Loading weights into allocated memory...\n");
+
+    // Skip header (128 bytes) - already read in metadata phase
+    fseek(fp, 128, SEEK_SET);
+    
+    // Helper macro for reading aligned tensors
+    #define READ_ALIGNED_TENSOR(ptr, expected_floats, name) do { \
+        size_t bytes_to_read = (expected_floats) * sizeof(float); \
+        size_t bytes_read = fread(ptr, 1, bytes_to_read, fp); \
+        if (bytes_read != bytes_to_read) { \
+            fprintf(stderr, "❌ Failed to read %s: expected %zu bytes, got %zu\n", \
+                    name, bytes_to_read, bytes_read); \
+            fclose(fp); \
+            return -1; \
+        } \
+    } while(0)
+    
+    // Progress tracking
+    int total_steps = 2 + M->num_layers + 1;
+    int current_step = 0;
+    
+    // 1. TOKEN EMBEDDINGS
+    printf("  [%2d/%2d] Loading token embeddings...\n", ++current_step, total_steps);
+    READ_ALIGNED_TENSOR(
+        M->memory_base + M->token_emb_offset,
+        M->vocab_size * M->aligned_embed_dim,
+        "token_embeddings"
+    );
+    
+    // 2. POSITION EMBEDDINGS
+    printf("  [%2d/%2d] Loading position embeddings...\n", ++current_step, total_steps);
+    READ_ALIGNED_TENSOR(
+        M->memory_base + M->pos_emb_offset,
+        M->context_window * M->aligned_embed_dim,
+        "position_embeddings"
+    );
+    
+    // 3. LAYER WEIGHTS
+    for (int layer = 0; layer < M->num_layers; layer++) {
+        printf("  [%2d/%2d] Loading layer %d/%d...\n", 
+               ++current_step, total_steps, layer + 1, M->num_layers);
+        
+        TrulyOptimalLayer *L = &M->layers[layer];
+        
+        // LayerNorm 1
+        READ_ALIGNED_TENSOR(M->memory_base + L->ln1_weight_offset, M->aligned_embed_dim, "ln1_weight");
+        READ_ALIGNED_TENSOR(M->memory_base + L->ln1_bias_offset, M->aligned_embed_dim, "ln1_bias");
+        
+        // Q, K, V weights and biases
+        READ_ALIGNED_TENSOR(M->memory_base + L->q_weight_offset, 
+                           M->aligned_embed_dim * M->aligned_embed_dim, "q_weight");
+        READ_ALIGNED_TENSOR(M->memory_base + L->q_bias_offset, M->aligned_embed_dim, "q_bias");
+        
+        READ_ALIGNED_TENSOR(M->memory_base + L->k_weight_offset,
+                           M->aligned_embed_dim * M->aligned_embed_dim, "k_weight");
+        READ_ALIGNED_TENSOR(M->memory_base + L->k_bias_offset, M->aligned_embed_dim, "k_bias");
+        
+        READ_ALIGNED_TENSOR(M->memory_base + L->v_weight_offset,
+                           M->aligned_embed_dim * M->aligned_embed_dim, "v_weight");
+        READ_ALIGNED_TENSOR(M->memory_base + L->v_bias_offset, M->aligned_embed_dim, "v_bias");
+        
+        // Projection
+        READ_ALIGNED_TENSOR(M->memory_base + L->proj_weight_offset,
+                           M->aligned_embed_dim * M->aligned_embed_dim, "proj_weight");
+        READ_ALIGNED_TENSOR(M->memory_base + L->proj_bias_offset, M->aligned_embed_dim, "proj_bias");
+        
+        // LayerNorm 2
+        READ_ALIGNED_TENSOR(M->memory_base + L->ln2_weight_offset, M->aligned_embed_dim, "ln2_weight");
+        READ_ALIGNED_TENSOR(M->memory_base + L->ln2_bias_offset, M->aligned_embed_dim, "ln2_bias");
+        
+        // MLP layers
+        READ_ALIGNED_TENSOR(M->memory_base + L->fc1_weight_offset,
+                           4 * M->aligned_embed_dim * M->aligned_embed_dim, "fc1_weight");
+        READ_ALIGNED_TENSOR(M->memory_base + L->fc1_bias_offset,
+                           4 * M->aligned_embed_dim, "fc1_bias");
+        
+        READ_ALIGNED_TENSOR(M->memory_base + L->fc2_weight_offset,
+                           4 * M->aligned_embed_dim * M->aligned_embed_dim, "fc2_weight");
+        READ_ALIGNED_TENSOR(M->memory_base + L->fc2_bias_offset,
+                           M->aligned_embed_dim, "fc2_bias");
+    }
+    
+    // 4. FINAL LAYERNORM
+    printf("  [%2d/%2d] Loading final LayerNorm...\n", ++current_step, total_steps);
+    READ_ALIGNED_TENSOR(M->memory_base + M->final_ln_weight_offset, M->aligned_embed_dim, "final_ln_weight");
+    READ_ALIGNED_TENSOR(M->memory_base + M->final_ln_bias_offset, M->aligned_embed_dim, "final_ln_bias");
+    
+    #undef READ_ALIGNED_TENSOR
+    
+    fclose(fp);
+    
+    // ============================================================================
+    // QUICK VALIDATION
+    // ============================================================================
+    
+    printf("\n🔍 Quick validation...\n");
+    
+    float *token_emb = M->memory_base + M->token_emb_offset;
+    float min_val = token_emb[0], max_val = token_emb[0];
+    
+    for (int i = 0; i < 100; i++) {
+        float val = token_emb[i];
+        if (val < min_val) min_val = val;
+        if (val > max_val) max_val = val;
+    }
+    
+    printf("  Token embeddings range: [%.6f, %.6f]\n", min_val, max_val);
+    
+    if (isnan(min_val) || isnan(max_val)) {
+        fprintf(stderr, "❌ NaN detected in embeddings!\n");
+        return -1;
+    }
+    
+    printf("  First 3 values: [%.4f, %.4f, %.4f]\n", 
+           token_emb[0], token_emb[1], token_emb[2]);
+    
+    printf("\n✅ Weights loaded successfully!\n");
+    return 0;
+}
+
+
+/**
+ * @brief Read model metadata from weight file header
+ * 
+ * This function ONLY reads the header and populates model dimensions.
+ * It does NOT allocate memory - that's your decision to make separately.
+ * 
+ * @param M Pointer to zero-initialized TransformerModel struct
+ * @param weight_file Path to the .weights file
+ * @return 0 on success, -1 on failure
+ */
+int read_model_metadata(TransformerModel *M, const char* weight_file) {
+    FILE *fp = fopen(weight_file, "rb");
+    if (!fp) {
+        fprintf(stderr, "❌ Could not open weight file: %s\n", weight_file);
+        return -1;
+    }
+
+    // Get file size for info
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    rewind(fp);
+    
+    printf("📦 Reading model metadata from %s (%.2f GB file)\n", 
+           weight_file, file_size / (1024.0 * 1024.0 * 1024.0));
+
+    // ============================================================================
+    // READ 128-BYTE HEADER DIRECTLY INTO MODEL STRUCT
+    // ============================================================================
+    
+    // Read magic, version, model_type
+    if (fread(M->magic, 1, 8, fp) != 8) {
+        fprintf(stderr, "❌ Failed to read magic\n");
+        fclose(fp);
+        return -1;
+    }
+    
+    if (fread(&M->version, sizeof(uint32_t), 1, fp) != 1) {
+        fprintf(stderr, "❌ Failed to read version\n");
+        fclose(fp);
+        return -1;
+    }
+    
+    if (fread(&M->model_type, sizeof(uint32_t), 1, fp) != 1) {
+        fprintf(stderr, "❌ Failed to read model_type\n");
+        fclose(fp);
+        return -1;
+    }
+    
+    // Read hyperparameters
+    uint32_t temp_val;
+    
+    fread(&temp_val, sizeof(uint32_t), 1, fp); M->num_layers = (int)temp_val;
+    fread(&temp_val, sizeof(uint32_t), 1, fp); M->vocab_size = (int)temp_val;
+    fread(&temp_val, sizeof(uint32_t), 1, fp); M->embed_dim = (int)temp_val;
+    fread(&temp_val, sizeof(uint32_t), 1, fp); M->context_window = (int)temp_val;
+    fread(&temp_val, sizeof(uint32_t), 1, fp); M->num_attention_heads = (int)temp_val;
+    fread(&temp_val, sizeof(uint32_t), 1, fp); M->head_dim = (int)temp_val;
+    
+    // Read aligned dimensions (for information - you'll recalculate these)
+    uint64_t file_aligned_embed, file_aligned_head, file_aligned_context;
+    fread(&file_aligned_embed, sizeof(uint64_t), 1, fp);
+    fread(&file_aligned_head, sizeof(uint64_t), 1, fp);
+    fread(&file_aligned_context, sizeof(uint64_t), 1, fp);
+    
+    // Read checksum and reserved
+    if (fread(M->checksum, 1, 32, fp) != 32) {
+        fprintf(stderr, "❌ Failed to read checksum\n");
+        fclose(fp);
+        return -1;
+    }
+    
+    if (fread(M->reserved, 1, 32, fp) != 32) {
+        fprintf(stderr, "❌ Failed to read reserved bytes\n");
+        fclose(fp);
+        return -1;
+    }
+    
+    fclose(fp);
+
+    // ============================================================================
+    // VALIDATE WHAT WE READ
+    // ============================================================================
+    
+    // Validate magic number
+    if (memcmp(M->magic, "BUMPWGT2", 8) != 0) {
+        fprintf(stderr, "❌ Invalid magic number. Expected 'BUMPWGT2', got '%.8s'\n", M->magic);
+        return -1;
+    }
+
+    // Validate version
+    if (M->version != 2) {
+        fprintf(stderr, "❌ Unsupported version %d (expected 2)\n", M->version);
+        return -1;
+    }
+
+    // Validate model type
+    if (M->model_type != 0) {
+        fprintf(stderr, "❌ Not a GPT-2 model (type=%d)\n", M->model_type);
+        return -1;
+    }
+
+    // Validate consistency
+    if (M->embed_dim != M->num_attention_heads * M->head_dim) {
+        fprintf(stderr, "❌ Inconsistent dimensions: embed_dim=%d != num_heads=%d * head_dim=%d\n",
+                M->embed_dim, M->num_attention_heads, M->head_dim);
+        return -1;
+    }
+    
+    printf("✅ Valid GPT-2 bump weights v%d\n", M->version);
+    printf("\n📊 Model configuration:\n");
+    printf("  Layers:        %d\n", M->num_layers);
+    printf("  Vocab:         %d\n", M->vocab_size);
+    printf("  Embed dim:     %d\n", M->embed_dim);
+    printf("  Context:       %d\n", M->context_window);
+    printf("  Heads:         %d\n", M->num_attention_heads);
+    printf("  Head dim:      %d\n", M->head_dim);
+    printf("  File aligned:  embed=%lu, head=%lu, context=%lu\n", 
+           file_aligned_embed, file_aligned_head, file_aligned_context);
+    
+    // Display checksum
+    printf("  Checksum:      ");
+    for (int i = 0; i < 8; i++) {
+        printf("%02x", M->checksum[i]);
+    }
+    printf("...\n");
+    
+    return 0;
+}
+
+int sample_token(float* logits, int vocab_size, float temperature) {
+    // Apply temperature
+    for (int i = 0; i < vocab_size; i++) {
+        logits[i] /= temperature;
+    }
+    
+    // Softmax
+    float max_logit = logits[0];
+    for (int i = 1; i < vocab_size; i++) {
+        if (logits[i] > max_logit) max_logit = logits[i];
+    }
+    
+    float sum = 0.0f;
+    for (int i = 0; i < vocab_size; i++) {
+        logits[i] = expf(logits[i] - max_logit);
+        sum += logits[i];
+    }
+    
+    // Sample
+    float r = (float)rand() / RAND_MAX * sum;
+    float cumsum = 0.0f;
+    for (int i = 0; i < vocab_size; i++) {
+        cumsum += logits[i];
+        if (cumsum > r) return i;
+    }
+    return vocab_size - 1;
+}
+
+void generate(TransformerModel* M, int* prompt, int prompt_len, int max_tokens) {
+    printf("🎲 Starting generation\n");
+    
+    // OPTION 1: Use stack allocation for token IDs
+    int32_t context[1024];  // Safe, separate from model memory
+    memset(context, 0, 1024 * sizeof(int32_t));
+    
+    // OR OPTION 2: Use the END of your model memory for token storage
+    // (after all the model data)
+    // int32_t* context = (int32_t*)(M->memory_base + M->total_floats - 1024);
+    
+    // Copy prompt
+    for (int i = 0; i < prompt_len && i < M->context_window; i++) {
+        context[i] = prompt[i];
+    }
+    
+    int current_pos = prompt_len;
+    
+    for (int step = 0; step < max_tokens; step++) {
+        printf("Step %d: ", step);
+        
+        // Embed the tokens into embedded_input_offset
+        embed_tokens(M, context, current_pos);
+        
+        // Now run forward pass starting from embedded vectors
+        size_t current_input = M->embedded_input_offset;
+        
+        for (int layer = 0; layer < M->num_layers; layer++) {
+            printf("  Layer %d\n", layer);
+            transformer_layer_forward(M, layer, current_input);
+            current_input = M->layers[layer].residual2_output_offset;
+        }
+        
+        // Final layernorm
+        layernorm_token_parallel(M, current_input, 
+                                M->final_ln_weight_offset,
+                                M->final_ln_bias_offset,
+                                M->final_ln_mean_offset,
+                                M->final_ln_rstd_offset,
+                                M->final_output_offset, 1e-5f);
+        
+        // Compute logits
+        compute_logits_last_token_optimized(M, current_pos - 1);
+        
+        // Sample
+        float* last_logits = M->memory_base + M->logits_offset + 
+                            (current_pos - 1) * M->vocab_size;
+        
+        int next_token = sample_token(last_logits, M->vocab_size, 0.6f);
+        
+        // Update context
+        if (current_pos < M->context_window) {
+            context[current_pos++] = next_token;
+        } else {
+            // Shift context window
+            memmove(context, context + 1, 
+                   (M->context_window - 1) * sizeof(int32_t));
+            context[M->context_window - 1] = next_token;
+        }
+        
+        printf("Generated token ID: %d\n", next_token);
+    }
+}
+
+
 /* ---------------- main -------------------- */
 int main(int argc, char **argv)
 {
     /* defaults (minimum 4 layers for benchmark) */
     int L = 4, V = 32768, C = 128, T = 128;
-    int head_dim = 64;  // ← ADD DEFAULT HEAD_DIM
+    int head_dim = 64;
     int do_alloc = 0;
     int run_benchmarks = 0;
+    const char* weight_file = NULL;  // New option for weight file
 
     static struct option long_opts[] = {
         {"layers", required_argument, 0, 'l'},
         {"dmodel", required_argument, 0, 'd'},
         {"ctx", required_argument, 0, 't'},
         {"vocab", required_argument, 0, 'v'},
-        {"head-dim", required_argument, 0, 'h'},  // ← ADD HEAD_DIM OPTION
+        {"head-dim", required_argument, 0, 'h'},
         {"force", no_argument, 0, 'f'},
         {"benchmark", no_argument, 0, 'b'},
+        {"weights", required_argument, 0, 'w'},  // New option for weight file
         {0, 0, 0, 0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "l:d:t:v:h:fb", long_opts, NULL)) != -1)  // ← ADD 'h:'
+    while ((c = getopt_long(argc, argv, "l:d:t:v:h:fbw:", long_opts, NULL)) != -1)
     {
         switch (c)
         {
@@ -3419,7 +3922,7 @@ int main(int argc, char **argv)
         case 'v':
             V = atoi(optarg);
             break;
-        case 'h':  // ← ADD HEAD_DIM CASE
+        case 'h':
             head_dim = atoi(optarg);
             break;
         case 'f':
@@ -3428,22 +3931,42 @@ int main(int argc, char **argv)
         case 'b':
             run_benchmarks = 1;
             break;
+        case 'w':  // New case for weight file
+            weight_file = optarg;
+            break;
         default:
-            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE]\n", argv[0]);
             return 1;
         }
     }
 
-    // ← ADD VALIDATION
+    /* ---------- try allocation ---------- */
+    TransformerModel M = {0};
+    
+    if (weight_file) {
+        // This handles EVERYTHING: read metadata, allocate, load weights
+        if (read_model_metadata(&M, weight_file) != 0) {
+            fprintf(stderr, "Failed to load GPT-2 model\n");
+            return 1;
+        }
+    } else {
+        M.num_layers = L;
+        M.vocab_size = V;
+        M.embed_dim = C;
+        M.context_window = T;
+        M.head_dim = head_dim;
+    }
+    
+        // ← ADD VALIDATION
     if (C % head_dim != 0) {
         fprintf(stderr, "❌ Error: embed_dim (%d) must be divisible by head_dim (%d)\n", C, head_dim);
         return 1;
     }
 
-    size_t need_bytes = bytes_needed(L, V, C, T);
+    size_t need_bytes = bytes_needed(M.num_layers, M.vocab_size, M.embed_dim, M.context_window);
     double need_gib = need_bytes / (1024.0 * 1024.0 * 1024.0);
 
-    printf("⚙  Requested model  L=%d  d_model=%d  ctx=%d  vocab=%d\n", L, C, T, V);
+    printf("⚙  Requested model  L=%d  d_model=%d  ctx=%d  vocab=%d\n", M.num_layers, M.embed_dim, M.context_window, M.vocab_size);
     printf("→ Would need ≈ %.2f GiB (%.0f bytes)\n", need_gib, (double)need_bytes);
 
     if (!do_alloc)
@@ -3458,14 +3981,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: For comprehensive benchmarks, at least --layers 4 is required to demonstrate testing across different kernels on separate layers.\n");
         return 1;
     }
-
-    /* ---------- try allocation ---------- */
-    TransformerModel M = {0};
-    M.num_layers = L;
-    M.vocab_size = V;
-    M.embed_dim = C;
-    M.context_window = T;
-    M.head_dim = head_dim;
+    
     M.num_attention_heads = M.embed_dim / M.head_dim;
 
     /* sanity: if system RAM < need_bytes, warn */
@@ -3484,7 +4000,7 @@ int main(int argc, char **argv)
     layout_transformer(&M);
     printf("✅ Success! mmap at %p, %.2f GiB reserved.\n",
            (void *)M.memory_base, need_gib);
-
+    
     /* Setup execution plan */
     long logical_cores = sysconf(_SC_NPROCESSORS_ONLN);
     int reserved_cores = 4; // for OS, logging, etc.
@@ -3499,6 +4015,19 @@ int main(int argc, char **argv)
     printf("📦 Each core will handle ≈ %d tokens from context window of %d tokens\n",
            M.tokens_per_core, M.context_window);
     printf("🧠 Attention heads = %d (head_dim=%d)\n", M.num_attention_heads, M.head_dim); 
+    
+    if (weight_file) {
+        srand(time(NULL));  // Seed the RNG
+        load_model_weights(&M, weight_file);
+        
+        // Test generation
+        //int prompt[] = {15496, 11, 314, 716};  // "Hello, I am"
+        // int prompt[] = {48, 25, 1867, 318, 262, 3139, 286, 4881, 30, 317, 25}; // Q: What is the capital of France? A:
+        int prompt[] = {2061, 318, 262, 362, 358, 1099, 286, 6268, 30}; // What is the 2nd law of motion?"
+        printf("\n🚀 Generating text...\n");
+        generate(&M, prompt, 10, 20);  // Generate 10 tokens
+    }
+
 
     if (run_benchmarks)
     {
