@@ -169,6 +169,137 @@ typedef struct {
     size_t layer_end_canary_offset;
 } TrulyOptimalLayer;
 
+/* ─── Per-Layer Backprop Structure ─────────────────────────────────── */
+typedef struct {
+    /* LAYER INPUT/OUTPUT */
+    size_t residual2_copy_offset;              // [T × D] output of this layer (from forward)
+    size_t d_residual2_offset;                 // [T × D] gradient from layer above
+    
+    /* ===== MLP BACKWARD PATH ===== */
+    // MLP output
+    size_t mlp_output_copy_offset;             // [T × D]
+    size_t d_mlp_output_offset;                // [T × D]
+    
+    // FC2: [T × 4D] -> [T × D]
+    size_t fc2_input_copy_offset;              // [T × 4D] (after GELU)
+    size_t fc2_weights_copy_offset;            // [4D × D]
+    size_t fc2_bias_copy_offset;               // [D]
+    size_t d_fc2_input_offset;                 // [T × 4D]
+    size_t d_fc2_weights_offset;               // [4D × D] accumulator
+    size_t d_fc2_bias_offset;                  // [D] accumulator
+    
+    // GELU
+    size_t fc1_output_copy_offset;             // [T × 4D] (before GELU)
+    size_t d_fc1_output_offset;                // [T × 4D]
+    
+    // FC1: [T × D] -> [T × 4D]
+    size_t ln2_output_copy_offset;             // [T × D]
+    size_t fc1_weights_copy_offset;            // [D × 4D]
+    size_t fc1_bias_copy_offset;               // [4D]
+    size_t d_ln2_output_offset;                // [T × D]
+    size_t d_fc1_weights_offset;               // [D × 4D] accumulator
+    size_t d_fc1_bias_offset;                  // [4D] accumulator
+    
+    // LayerNorm2
+    size_t ln2_input_copy_offset;              // [T × D] (residual1)
+    size_t ln2_mean_copy_offset;               // [T]
+    size_t ln2_rstd_copy_offset;               // [T]
+    size_t ln2_gamma_copy_offset;              // [D]
+    size_t ln2_beta_copy_offset;               // [D]
+    size_t d_ln2_input_offset;                 // [T × D]
+    size_t d_ln2_gamma_offset;                 // [D] accumulator
+    size_t d_ln2_beta_offset;                  // [D] accumulator
+    
+    /* ===== ATTENTION BACKWARD PATH ===== */
+    // Residual1
+    size_t residual1_copy_offset;              // [T × D]
+    size_t d_residual1_offset;                 // [T × D]
+    
+    // Attention output projection
+    size_t attention_output_copy_offset;       // [T × D]
+    size_t proj_weights_copy_offset;           // [D × D]
+    size_t proj_bias_copy_offset;              // [D]
+    size_t d_attention_output_offset;          // [T × D]
+    size_t d_proj_weights_offset;              // [D × D] accumulator
+    size_t d_proj_bias_offset;                 // [D] accumulator
+    
+    // Attention mechanism
+    size_t attention_weights_copy_offset;      // [n_heads × T × T] (after softmax)
+    size_t v_output_copy_offset;               // [T × n_heads × H]
+    size_t d_attention_weights_offset;         // [n_heads × T × T]
+    size_t d_v_output_offset;                  // [T × n_heads × H]
+    
+    // Softmax backward
+    size_t attention_scores_copy_offset;       // [n_heads × T × T] (before softmax)
+    size_t d_attention_scores_offset;          // [n_heads × T × T]
+    
+    // QK^T backward
+    size_t q_output_copy_offset;               // [T × n_heads × H]
+    size_t k_output_copy_offset;               // [T × n_heads × H]
+    size_t d_q_output_offset;                  // [T × n_heads × H]
+    size_t d_k_output_offset;                  // [T × n_heads × H]
+    
+    // Q, K, V projections
+    size_t ln1_output_copy_offset;             // [T × D]
+    size_t q_weights_copy_offset;              // [D × D]
+    size_t q_bias_copy_offset;                 // [D]
+    size_t k_weights_copy_offset;              // [D × D]
+    size_t k_bias_copy_offset;                 // [D]
+    size_t v_weights_copy_offset;              // [D × D]
+    size_t v_bias_copy_offset;                 // [D]
+    size_t d_ln1_output_offset;                // [T × D] (accumulates Q,K,V grads)
+    size_t d_q_weights_offset;                 // [D × D] accumulator
+    size_t d_q_bias_offset;                    // [D] accumulator
+    size_t d_k_weights_offset;                 // [D × D] accumulator
+    size_t d_k_bias_offset;                    // [D] accumulator
+    size_t d_v_weights_offset;                 // [D × D] accumulator
+    size_t d_v_bias_offset;                    // [D] accumulator
+    
+    // LayerNorm1
+    size_t ln1_input_copy_offset;              // [T × D]
+    size_t ln1_mean_copy_offset;               // [T]
+    size_t ln1_rstd_copy_offset;               // [T]
+    size_t ln1_gamma_copy_offset;              // [D]
+    size_t ln1_beta_copy_offset;               // [D]
+    size_t d_ln1_input_offset;                 // [T × D] flows to previous layer
+    size_t d_ln1_gamma_offset;                 // [D] accumulator
+    size_t d_ln1_beta_offset;                  // [D] accumulator
+    
+} LayerGradients;
+
+/* ─── Complete Backprop Memory Structure ─────────────────────────────── */
+typedef struct {
+    /* Single contiguous memory block for EVERYTHING needed in backprop */
+    size_t backprop_base;
+    size_t total_gradient_floats;
+    
+    /* ===== STAGE 1: LOSS & INITIAL GRADIENTS ===== */
+    size_t logits_copy_offset;                 // [T × V] copy of forward logits
+    size_t actual_tokens_offset;               // [T] copy of target tokens (as floats for alignment)
+    size_t d_logits_offset;                    // [T × V] gradient w.r.t logits
+    
+    /* ===== STAGE 2: FINAL OUTPUT LAYER ===== */
+    size_t final_output_copy_offset;           // [T × D] copy from forward
+    size_t d_final_output_offset;              // [T × D] gradient
+    size_t d_embed_weights_offset;             // [V × D] gradient accumulator
+    
+    /* ===== STAGE 3: FINAL LAYERNORM ===== */
+    size_t final_ln_input_copy_offset;         // [T × D] input to final LN
+    size_t final_ln_mean_copy_offset;          // [T] mean from forward
+    size_t final_ln_rstd_copy_offset;          // [T] rstd from forward  
+    size_t final_ln_gamma_copy_offset;         // [D] weights
+    size_t final_ln_beta_copy_offset;          // [D] bias
+    size_t d_final_ln_input_offset;            // [T × D] gradient to previous layer
+    size_t d_final_ln_gamma_offset;            // [D] weight gradient
+    size_t d_final_ln_beta_offset;             // [D] bias gradient
+    
+    /* ===== PER-LAYER BACKPROP MEMORY ===== */
+    LayerGradients* layers;         // Array of per-layer gradient structs
+    
+    size_t layer_backprop_stride;              // Distance between layers
+    
+} GradientStorage;
+
 typedef struct
 {
     /* File metadata (from weight file header) */
@@ -208,6 +339,11 @@ typedef struct
     size_t lm_head_weight_offset;
     size_t logits_offset;
     
+        /* ============ TRAINING ============ */
+    GradientStorage gradients;     // NULL for inference, allocated for training
+    bool training_enabled;
+    float learning_rate;
+    
     /* Weight file metadata */
     uint8_t checksum[32];       // SHA256 from file
     uint8_t reserved[32];       // Reserved for future use
@@ -219,6 +355,160 @@ static inline size_t bump(size_t *off, size_t count, size_t alignB) {
     size_t here = *off;
     *off += count;
     return here;
+}
+
+
+ /**
+ * @brief Lays out the memory for the backward pass.
+ *
+ * @param M Pointer to the TransformerModel struct.
+ * @param offset Pointer to the current memory offset, which will be updated.
+ *
+ * @details
+ * This function allocates a dedicated, contiguous memory arena for all data
+ * required during backpropagation. This includes:
+ * - **GRADS:** Buffers to accumulate gradients for every weight and bias.
+ * - **ACTS:** Cached copies of activations from the forward pass needed by the backward pass.
+ * - **dACTS:** Buffers to hold the gradients of activations as they flow backward.
+ *
+ * @verbatim
+ * ┌────────────────────────────────────────────────────────────┐
+ * │ Global GRADS (Embeddings, Final LN)                        │
+ * ├────────────────────────────────────────────────────────────┤
+ * │ Global ACTS (Logits, Final LN inputs...)                   │
+ * ├────────────────────────────────────────────────────────────┤
+ * │ Global dACTS (dLogits, dFinal_output...)                   │
+ * ├────────────────────────────────────────────────────────────┤
+ * │ Per-Layer Arena (Layer 0)                                  │
+ * │ ┌────────────────────────────────────────────────────────┐ │
+ * │ │ Layer 0 ACTS (ln_mean, attn_probs, fc1_preact...)      │ │
+ * │ ├────────────────────────────────────────────────────────┤ │
+ * │ │ Layer 0 dACTS (dL/d_mlp_output, dL/d_attn_output...)   │ │
+ * │ ├────────────────────────────────────────────────────────┤ │
+ * │ │ Layer 0 GRADS (dL/dW_fc1, dL/dW_q...)                  │ │
+ * │ └────────────────────────────────────────────────────────┘ │
+ * ├────────────────────────────────────────────────────────────┤
+ * │ ... repeated for each layer ...                            │
+ * └────────────────────────────────────────────────────────────┘
+ * @endverbatim
+ */
+void layout_gradients(TransformerModel *M, size_t *offset) {
+    // Continue from where forward pass left off
+    size_t off = *offset;
+    
+    // Allocate GradientStorage struct
+    M->gradients.backprop_base = off; 
+    
+    size_t D = M->aligned_embed_dim;
+    size_t H = M->aligned_head_dim;
+    size_t T = M->context_window;
+    size_t V = M->vocab_size;
+    size_t n_heads = M->num_attention_heads;
+    
+    /* ===== GLOBAL GRADIENT STORAGE ===== */
+    
+    // Stage 1: Loss computation
+    M->gradients.logits_copy_offset = bump(&off, T * V, CACHE_ALIGN);
+    M->gradients.actual_tokens_offset = bump(&off, T, CACHE_ALIGN);
+    M->gradients.d_logits_offset = bump(&off, T * V, CACHE_ALIGN);
+    
+    // Stage 2: Final output layer
+    M->gradients.final_output_copy_offset = bump(&off, T * D, CACHE_ALIGN);
+    M->gradients.d_final_output_offset = bump(&off, T * D, CACHE_ALIGN);
+    M->gradients.d_embed_weights_offset = bump(&off, V * D, CACHE_ALIGN);
+    
+    // Stage 3: Final LayerNorm
+    M->gradients.final_ln_input_copy_offset = bump(&off, T * D, CACHE_ALIGN);
+    M->gradients.final_ln_mean_copy_offset = bump(&off, T, CACHE_ALIGN);
+    M->gradients.final_ln_rstd_copy_offset = bump(&off, T, CACHE_ALIGN);
+    M->gradients.final_ln_gamma_copy_offset = bump(&off, D, CACHE_ALIGN);
+    M->gradients.final_ln_beta_copy_offset = bump(&off, D, CACHE_ALIGN);
+    M->gradients.d_final_ln_input_offset = bump(&off, T * D, CACHE_ALIGN);
+    M->gradients.d_final_ln_gamma_offset = bump(&off, D, CACHE_ALIGN);
+    M->gradients.d_final_ln_beta_offset = bump(&off, D, CACHE_ALIGN);
+    
+    /* ===== PER-LAYER GRADIENT STORAGE ===== */
+    
+    M->gradients.layers = (LayerGradients*)calloc(M->num_layers, sizeof(LayerGradients));
+    if (!M->gradients.layers) {
+        perror("Failed to allocate LayerGradients array");
+        exit(EXIT_FAILURE);
+    }
+    
+    for (int l = 0; l < M->num_layers; l++) {
+        LayerGradients *L = &M->gradients.layers[l];
+
+        // Layer output
+        L->residual2_copy_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_residual2_offset = bump(&off, T * D, CACHE_ALIGN);
+
+        // MLP Backward
+        L->mlp_output_copy_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_mlp_output_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->fc2_input_copy_offset = bump(&off, T * 4 * D, CACHE_ALIGN);
+        L->d_fc2_input_offset = bump(&off, T * 4 * D, CACHE_ALIGN);
+        L->d_fc2_weights_offset = bump(&off, 4 * D * D, CACHE_ALIGN);
+        L->d_fc2_bias_offset = bump(&off, D, CACHE_ALIGN);
+        L->fc1_output_copy_offset = bump(&off, T * 4 * D, CACHE_ALIGN);
+        L->d_fc1_output_offset = bump(&off, T * 4 * D, CACHE_ALIGN);
+        L->ln2_output_copy_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_ln2_output_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_fc1_weights_offset = bump(&off, D * 4 * D, CACHE_ALIGN);
+        L->d_fc1_bias_offset = bump(&off, 4 * D, CACHE_ALIGN);
+
+        // LayerNorm2 Backward
+        L->ln2_input_copy_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->ln2_mean_copy_offset = bump(&off, T, CACHE_ALIGN);
+        L->ln2_rstd_copy_offset = bump(&off, T, CACHE_ALIGN);
+        L->ln2_gamma_copy_offset = bump(&off, D, CACHE_ALIGN);
+        L->d_ln2_input_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_ln2_gamma_offset = bump(&off, D, CACHE_ALIGN);
+        L->d_ln2_beta_offset = bump(&off, D, CACHE_ALIGN);
+
+        // Attention Backward
+        L->residual1_copy_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_residual1_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->attention_output_copy_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_attention_output_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_proj_weights_offset = bump(&off, D * D, CACHE_ALIGN);
+        L->d_proj_bias_offset = bump(&off, D, CACHE_ALIGN);
+
+        // Attention mechanism
+        L->attention_weights_copy_offset = bump(&off, n_heads * T * T, CACHE_ALIGN);
+        L->v_output_copy_offset = bump(&off, T * n_heads * H, CACHE_ALIGN);
+        L->d_attention_weights_offset = bump(&off, n_heads * T * T, CACHE_ALIGN);
+        L->d_v_output_offset = bump(&off, T * n_heads * H, CACHE_ALIGN);
+        L->attention_scores_copy_offset = bump(&off, n_heads * T * T, CACHE_ALIGN);
+        L->d_attention_scores_offset = bump(&off, n_heads * T * T, CACHE_ALIGN);
+        L->q_output_copy_offset = bump(&off, T * n_heads * H, CACHE_ALIGN);
+        L->k_output_copy_offset = bump(&off, T * n_heads * H, CACHE_ALIGN);
+        L->d_q_output_offset = bump(&off, T * n_heads * H, CACHE_ALIGN);
+        L->d_k_output_offset = bump(&off, T * n_heads * H, CACHE_ALIGN);
+
+        // QKV projections
+        L->ln1_output_copy_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_ln1_output_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_q_weights_offset = bump(&off, D * D, CACHE_ALIGN);
+        L->d_q_bias_offset = bump(&off, D, CACHE_ALIGN);
+        L->d_k_weights_offset = bump(&off, D * D, CACHE_ALIGN);
+        L->d_k_bias_offset = bump(&off, D, CACHE_ALIGN);
+        L->d_v_weights_offset = bump(&off, D * D, CACHE_ALIGN);
+        L->d_v_bias_offset = bump(&off, D, CACHE_ALIGN);
+
+        // LayerNorm1 Backward
+        L->ln1_input_copy_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->ln1_mean_copy_offset = bump(&off, T, CACHE_ALIGN);
+        L->ln1_rstd_copy_offset = bump(&off, T, CACHE_ALIGN);
+        L->ln1_gamma_copy_offset = bump(&off, D, CACHE_ALIGN);
+        L->d_ln1_input_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_ln1_gamma_offset = bump(&off, D, CACHE_ALIGN);
+        L->d_ln1_beta_offset = bump(&off, D, CACHE_ALIGN);
+    }
+    // Update total gradient floats
+    M->gradients.total_gradient_floats = off - *offset;
+    
+    // Return the updated offset
+    *offset = off;
 }
 
 /**
@@ -272,7 +562,7 @@ static inline size_t bump(size_t *off, size_t count, size_t alignB) {
  *
  * This memory map ensures high locality for token-wise, head-wise, and GEMM-parallel computations.
  */
-void layout_transformer(TransformerModel *M) {
+void layout_transformer(TransformerModel *M, bool training_mode) {
     size_t off = 0;
     size_t aligned_embed_dim = align_up(M->embed_dim, CACHE_ALIGN / sizeof(float));
     M->aligned_embed_dim = aligned_embed_dim;
@@ -367,6 +657,16 @@ void layout_transformer(TransformerModel *M) {
 
     // Then if you're doing language modeling, you might also want:
     M->logits_offset = bump(&off, (size_t)M->context_window * M->vocab_size, CACHE_ALIGN);
+    
+    // After forward pass layout is done
+    if (training_mode) {
+        M->training_enabled = true;
+        
+        // Continue allocation for gradients
+        layout_gradients(M, &off);
+        
+        // Now off includes both forward AND backward memory
+    }
 
     // The `off` variable now marks the end of the usable model data.
     // We add a final, larger canary zone to the total allocation size.
@@ -378,6 +678,11 @@ void layout_transformer(TransformerModel *M) {
         perror("Failed to allocate model memory");
         exit(EXIT_FAILURE);
     }
+    
+    printf("Memory allocated: %.2f GB (Forward: %.2f GB, Gradient: %.2f GB)\n",
+       (M->total_floats * sizeof(float)) / (1024.0 * 1024.0 * 1024.0),
+       ((off - (training_mode ? M->gradients.total_gradient_floats : 0)) * sizeof(float)) / (1024.0 * 1024.0 * 1024.0),
+       (training_mode ? (M->gradients.total_gradient_floats * sizeof(float)) / (1024.0 * 1024.0 * 1024.0) : 0.0));
 }
 
 /* ─── destruction helper ─────────────────────────────────────────── */
@@ -385,6 +690,9 @@ void destroy_transformer(TransformerModel *M)
 {
     munmap(M->memory_base, align_up(M->total_floats * sizeof(float), HUGE_ALIGN));
     free(M->layers);
+    if (M->training_enabled  && M->gradients.layers) {
+        free(M->gradients.layers);
+    }
 }
 
 // Calculate memory requirements
@@ -3311,46 +3619,6 @@ void transformer_layer_forward(TransformerModel *M, int layer_idx, size_t layer_
                                 L->residual2_output_offset);
 }
 
-// ================================================================
-// FULL FORWARD PASS
-// ================================================================
-
-
-void transformer_forward_pass(TransformerModel *M, size_t input_offset) 
-{
-    printf("  FWD: Entry\n");
-    fflush(stdout);
-    
-    // This might be the issue!
-    printf("  FWD: Calling add_gpt2_token_and_positional_embeddings\n");
-    fflush(stdout);
-    
-    add_gpt2_token_and_positional_embeddings(M, 
-        input_offset,
-        M->embedded_input_offset
-    );
-    
-    printf("  FWD: Embeddings done\n");
-    fflush(stdout);
-    
-    size_t current_input = M->embedded_input_offset;
-    
-    for (int layer = 0; layer < M->num_layers; layer++) {
-        printf("  FWD: Layer %d starting\n", layer);
-        fflush(stdout);
-        
-        transformer_layer_forward(M, layer, current_input);
-        
-        printf("  FWD: Layer %d done\n", layer);
-        fflush(stdout);
-        
-        current_input = M->layers[layer].residual2_output_offset;
-    }
-    
-    printf("  FWD: Complete\n");
-    fflush(stdout);
-}
-
 // ============================================================================
 // COMPREHENSIVE BENCHMARK DRIVER
 // ============================================================================
@@ -3997,7 +4265,7 @@ int main(int argc, char **argv)
     }
 
     printf("Allocating huge block... this may page-fault if hugepages are missing\n");
-    layout_transformer(&M);
+    layout_transformer(&M, M.training_enabled);
     printf("✅ Success! mmap at %p, %.2f GiB reserved.\n",
            (void *)M.memory_base, need_gib);
     
