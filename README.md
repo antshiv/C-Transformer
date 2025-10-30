@@ -4,7 +4,10 @@
 
 # 🚀 C-Transformers: Cache-Optimized Transformers in C
 
-Building Embedded AI from Scratch — in C, on CPUs, for Real-Time Autonomy.
+Building Embedded AI from Scratch — in C, on CPUs (x86 optimized), for Real-Time Autonomy.
+
+[![Documentation](https://img.shields.io/badge/docs-doxygen-blue)](https://antshiv.github.io/C-Transformer/)
+[![Build](https://github.com/antshiv/C-Transformer/actions/workflows/doxygen.yml/badge.svg)](https://github.com/antshiv/C-Transformer/actions/workflows/doxygen.yml)
 
 This project is a pure C implementation of a GPT-style transformer model with:
 - 🧠 Fully contiguous, single-block memory layout
@@ -12,6 +15,25 @@ This project is a pure C implementation of a GPT-style transformer model with:
 - 🧱 Hugepage-backed allocations (2MB) to minimize TLB misses
 - ⚙️ Inline memory bump allocator to track offsets precisely
 - 🔧 Dry-run and allocation modes for profiling model memory capacity
+
+---
+
+## 📚 Documentation
+
+**[📖 View Full API Documentation](https://antshiv.github.io/C-Transformer/)**
+
+Comprehensive Doxygen documentation covering:
+- Memory architecture and contiguous block design
+- Token-level and head-level parallelism strategies
+- Cache optimization techniques and alignment
+- AVX-512 kernels and SIMD optimizations
+- Function-by-function API reference with performance notes
+
+**Generate docs locally:**
+```bash
+./run_doxygen.sh
+# Open docs/html/index.html in your browser
+```
 
 ---
 
