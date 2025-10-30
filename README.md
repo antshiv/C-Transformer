@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/c-ttransformer.png" alt="C-Transformer Logo" width="400"/>
+</div>
+
 # 🚀 C-Transformers: Cache-Optimized Transformers in C
 
 Building Embedded AI from Scratch — in C, on CPUs, for Real-Time Autonomy.
@@ -42,7 +46,34 @@ chmod +x script.sh
 ./script.sh
 ```
 
-## 🧪 Example
+## 🚀 Quick Start: Text Generation
+
+**Prerequisites:**
+```bash
+pip3 install transformers --break-system-packages
+```
+
+**Simple workflow:**
+
+```bash
+# 1. Encode text to tokens
+python3 encode.py "Hello, I am"
+
+# 2. Run inference (all-in-one: encode → infer → decode)
+python3 run.py "Hello, I am"
+
+# 3. Decode output manually (if needed)
+python3 decode.py output_*.txt
+```
+
+**Example output:**
+```
+📝 Input text: Hello, I am
+📤 GENERATED: a student at the University of
+📖 FULL TEXT: Hello, I am a student at the University of
+```
+
+## 🧪 Advanced Examples
 
 ```bash
 # Dry run (estimate memory usage only)
@@ -50,6 +81,9 @@ chmod +x script.sh
 
 # Force allocation with hugepages
 ./main --layers 12 --dmodel 384 --ctx 256 --vocab 32768 --force
+
+# Run inference with custom weights
+python3 run.py "The future of AI" --weights gpt2_bump.weights --num-tokens 20
 ```
 
 ## 🔧 Usage Examples
