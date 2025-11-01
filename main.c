@@ -5,443 +5,57 @@
  * @version 1.0
  * @date 2025
  *
- * @mainpage C-Transformer: Why CPUs for Large Language Models?
+ * @mainpage C-Transformer: A CPU-First Engine for LLMs
  *
- * @section vision The Vision: CPUs as First-Class LLM Platforms
+ * @section about What is C-Transformer?
  *
- * **The GPU narrative is incomplete.** While GPUs excel at embarrassingly parallel workloads,
- * modern server CPUs — when properly optimized — offer compelling advantages for LLM inference
- * and training that are often overlooked.
+ * C-Transformer is a pure C runtime for transformer models, meticulously engineered for high-performance
+ * inference and training on modern x86-64 CPUs. It serves as both a practical engine and an educational
+ * tool for exploring advanced CPU optimization techniques.
  *
- * This repository demonstrates that **CPU-based LLM systems are not just viable, but optimal**
- * for many real-world deployment scenarios, especially when leveraging:
- * - 🚀 **Modern server CPU capabilities** (128+ cores, AVX-512, AMX)
- * - 💾 **Massive DDR5 memory bandwidth** (up to 1TB+ per socket)
- * - 🌐 **High-speed interconnects** (100+ Gbps Ethernet, CXL)
- * - 🔧 **Software optimization techniques** (cache-aware design, NUMA tuning)
+ * This file implements:
+ * - **A unified memory layout** for weights, activations, and gradients in a single contiguous block.
+ * - **Both inference and backpropagation** logic from first principles.
+ * - **Advanced CPU optimizations**, including:
+ *   - SIMD vectorization using AVX-512.
+ *   - Multi-threading with OpenMP, designed for NUMA and cache awareness.
+ *   - Hugepage-backed memory to minimize TLB misses.
+ * - **Hybrid parallelism**, combining:
+ *   - **Token-level parallelism** for prompt processing.
+ *   - **Head-level parallelism** for attention computation.
+ *   - A fixed batch size of 1, optimized for real-time inference.
  *
- * ═══════════════════════════════════════════════════════════════════════════════
- * @section cpu_trends Hardware Trends Favoring CPUs for LLMs
- * ═══════════════════════════════════════════════════════════════════════════════
+ * @section why_cpu Why Focus on CPUs? The Strategic Bet
  *
- * @subsection trend_memory Memory: The Great Equalizer
+ * The prevailing narrative suggests GPUs are the only viable platform for serious AI. This project challenges that notion by arguing that the true comparison is not "CPU vs. GPU," but rather the **Open CPU Ecosystem** versus the **Proprietary NVIDIA Ecosystem**.
  *
- * **DDR5 Revolution (2024-2025)**:
- * - **Capacity**: 1.5TB per CPU socket (12 × 128GB DIMMs @ DDR5-5600)
- * - **Bandwidth**: 450 GB/s per socket (8-channel DDR5-5600)
- * - **Dual Socket**: 3TB total, 900 GB/s aggregate bandwidth
- * - **Cost**: ~$2-3/GB vs GPU HBM at $20-30/GB
+ * ### The CPU Advantage: A Bet on Open, Commodity Hardware
  *
- * **Why This Matters for LLMs**:
- * - GPT-2 (1.5B params): 6GB weights + 2GB activations = **8GB** (fits in CPU cache hierarchy)
- * - GPT-3 (175B params): 700GB weights → **Fits in dual-socket CPU RAM**
- * - No PCIe bottleneck for model loading (GPU: 64 GB/s PCIe 5.0 vs CPU: local DRAM access)
- * - Unified memory model (no CPU↔GPU transfers)
+ * We believe that the relentless pace of open hardware development will make CPUs an increasingly powerful and cost-effective platform for AI.
  *
- * @subsection trend_cores Core Count: Massive Parallelism
+ * - **Massive, Affordable Memory**: The latest Intel Xeon and AMD EPYC CPUs support up to 12 channels of DDR5 memory per socket, with DDR6 on the horizon. This allows entire large models (175B+ parameters) to reside in high-bandwidth, commodity DRAM, eliminating the PCIe bottleneck and HBM capacity limits inherent to GPUs.
  *
- * **Modern Server CPUs (2024)**:
- * - AMD EPYC 9654 (Genoa): **96 cores / 192 threads** per socket
- * - Intel Xeon Platinum 8592+: **64 cores / 128 threads** per socket
- * - Dual socket: **128-192 physical cores**
- * - ARM Ampere Altra Max: **128 cores** per socket
+ * - **Explosive Parallelism**: With core counts exceeding 128 per socket and advanced SIMD instruction sets like AVX-512 for 1D tensor math and AMX for 2D matrix math, CPUs are becoming massively parallel compute engines in their own right.
  *
- * **Parallelism Model**:
- * ```
- * Token-Level Parallelism:
- *   1024 tokens ÷ 128 cores = 8 tokens per core (perfect load balance)
+ * - **Accelerated Data Movement**: On-chip accelerators like Intel's Data Streaming Accelerator (DSA) and DMA engines on ARM offload memory copy operations, freeing up compute cores to focus on arithmetic.
  *
- * Head-Level Parallelism:
- *   12 attention heads × 8 cores per head = 96 cores utilized
+ * - **Freedom from Vendor Lock-In**: The entire CPU ecosystem is built on commodity hardware and open standards. There is no proprietary lock-in equivalent to NVIDIA's CUDA. This fosters competition, drives down cost, and guarantees that performance gains from new hardware generations (e.g., DDR6, 600 Gb/s Ethernet) are immediately accessible without being tied to a single vendor's roadmap.
  *
- * Batch Parallelism:
- *   Process 128 independent requests concurrently
- * ```
+ * ### The Long-Term Vision
  *
- * @subsection trend_simd SIMD: Specialized AI Instructions
+ * As AI models become more efficient and capable, the raw performance gap between CPUs and specialized accelerators will narrow. The combination of ever-improving commodity hardware and sophisticated, cache-aware software design makes the CPU a powerful, open, and increasingly competitive contender for both inference and training. **This project is a bet on that future.**
  *
- * **AVX-512 (2016-present)**:
- * - 512-bit vectors = 16 × FP32 operations per instruction
- * - 2 FMA units × 16 floats = **32 FLOPs per cycle**
- * - At 3.0 GHz: 96 GFLOPS per core
- * - 64-core CPU: **6.1 TFLOPS** (comparable to GTX 1080 Ti)
- *
- * **Intel AMX (Advanced Matrix Extensions, 2023)**:
- * - 8×8 matrix multiply per instruction (BF16/INT8)
- * - **2048 INT8 ops per cycle** per core
- * - 64-core CPU @ 3.0 GHz: **393 TOPS** (INT8)
- * - Competitive with NVIDIA A100 Tensor Cores for inference
- *
- * **ARM SVE/SVE2 (Scalable Vector Extension)**:
- * - Scalable vector lengths (128-2048 bits)
- * - Optimized for ML workloads on ARM servers
- *
- * @subsection trend_interconnect Networking: Scale-Out Architecture
- *
- * **Modern Interconnects**:
- * - 100 Gbps Ethernet: 12.5 GB/s per link (commodity hardware)
- * - 200/400 Gbps InfiniBand: 25-50 GB/s per link
- * - CXL (Compute Express Link): Cache-coherent memory pooling across sockets
- *
- * **Distributed Training Advantages**:
- * - Gradient synchronization: AllReduce over 100 Gbps network (latency < 10μs)
- * - Model parallelism: Layers distributed across CPU nodes
- * - No GPU memory fragmentation (each CPU has full DRAM access)
- *
- * @subsection trend_dual_socket Dual Socket: 2X Everything
- *
- * **Configuration Example (2× Intel Xeon Platinum 8592+)**:
- * - **Cores**: 2 × 64 = **128 cores / 256 threads**
- * - **Memory**: 2 × 1.5TB = **3TB DDR5** (900 GB/s bandwidth)
- * - **SIMD**: 2 × 64 cores × 96 GFLOPS = **12.3 TFLOPS**
- * - **Cost**: ~$30K (vs $100K for NVIDIA H100)
- *
- * **NUMA-Aware Optimization**:
- * - Pin model layers to local NUMA nodes
- * - Minimize cross-socket memory access
- * - Achieve near-linear 2X scaling
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * @section gpu_reality The GPU Reality: It's Really NVIDIA vs Everyone Else
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * @subsection nvidia_monopoly The NVIDIA Monopoly
- *
- * **When people say "GPU," they mean NVIDIA. Period.**
- *
- * **Market Share in AI/ML (2024)**:
- * - NVIDIA: **~95%** of AI accelerator market
- * - AMD (MI250X, MI300): **~3%** (PyTorch support improving, but niche)
- * - Intel (Ponte Vecchio, Xe): **~1%** (emerging, limited ecosystem)
- * - Other vendors: **~1%** (negligible)
- *
- * **Why This Matters**:
- * ```
- * "GPU vs CPU" is misleading terminology.
- * The real comparison is:
- *
- *   NVIDIA Ecosystem  vs  Open CPU Ecosystem
- *        (CUDA)              (x86, ARM, RISC-V)
- * ```
- *
- * @subsection nvidia_lock_in The CUDA Lock-In Problem
- *
- * **Vendor Lock-In Risks**:
- * - ❌ **Proprietary API**: CUDA is NVIDIA-only (not portable)
- * - ❌ **Price Control**: NVIDIA sets prices (H100: $25K-40K per card)
- * - ❌ **Supply Control**: Artificial scarcity during launches
- * - ❌ **Forced Upgrades**: Older GPUs deprecated (compute capability sunset)
- * - ❌ **Licensing**: CUDA toolkit terms restrict cloud usage
- *
- * **Compare to CPU Ecosystem**:
- * - ✅ **Open Standards**: x86-64, ARM, RISC-V (multiple vendors)
- * - ✅ **Competition**: Intel vs AMD vs ARM (drives prices down)
- * - ✅ **Portability**: C/C++ code runs anywhere
- * - ✅ **Longevity**: 10+ year CPU support cycles
- * - ✅ **No Vendor Lock-In**: Can switch Intel ↔ AMD seamlessly
- *
- * @subsection alternatives The Alternative GPU Landscape
- *
- * **AMD Radeon Instinct (MI250X, MI300X)**:
- * - ROCm ecosystem (open-source, but immature)
- * - PyTorch support improving, but fragile
- * - ~3% market share (mostly HPC, not AI/ML)
- * - **Reality**: Not used in production AI deployments
- *
- * **Intel Data Center GPU Max (Ponte Vecchio)**:
- * - oneAPI ecosystem (open-source)
- * - 128GB HBM2e, competitive specs
- * - **Reality**: Launched 2023, minimal adoption
- *
- * **Google TPUs**:
- * - Custom ASIC (not a GPU)
- * - Excellent for Google Cloud, unusable elsewhere
- * - JAX ecosystem (TensorFlow-focused)
- * - **Reality**: Cloud-only, vendor lock-in to Google
- *
- * **The Verdict**: For practical purposes, **GPU = NVIDIA** in AI/ML.
- *
- * @subsection nvidia_vs_cpu NVIDIA vs CPU: The Real Comparison
- *
- * **Cost Analysis (2024)**:
- * ```
- * NVIDIA H100 (80GB HBM3):
- *   - Hardware: $25,000-40,000 per GPU
- *   - 8-GPU server: $250,000+ (bare minimum for training)
- *   - Power: 700W per GPU × 8 = 5.6kW
- *   - Cooling: Additional $50K+ for liquid cooling
- *   - Total: $300K+ for single 8-GPU node
- *
- * Dual Intel Xeon Platinum 8592+ (128 cores, 3TB RAM):
- *   - Hardware: $30,000-40,000 total
- *   - Power: 350W per socket × 2 = 700W
- *   - Cooling: Standard air cooling ($2K)
- *   - Total: $35K for dual-socket node
- *
- * Cost Ratio: 8.5X cheaper for CPU
- * ```
- *
- * **Performance Reality Check**:
- * - NVIDIA H100: 2000 TFLOPS (FP8), $40K
- * - 2× Xeon 64-core: 12.3 TFLOPS (FP32), $35K
- * - **BUT**: Memory matters more than FLOPS for LLMs
- *   - H100: 80GB HBM3 @ 3TB/s (memory-bound)
- *   - Xeon: 3TB DDR5 @ 900 GB/s (37X more capacity)
- *
- * **For Large Models (>100B params)**:
- * - NVIDIA: Requires 8+ GPUs + NVLink + model sharding
- * - CPU: Single dual-socket node with 3TB unified memory
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * @section cpu_vs_gpu When CPUs Beat NVIDIA GPUs for LLMs
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * @subsection use_case_inference Inference Workloads
- *
- * **CPUs Win When**:
- * - ✅ **Batch Size = 1** (single user queries): NVIDIA's parallelism advantage lost
- * - ✅ **Latency-Critical** (<10ms response time): No PCIe transfer overhead
- * - ✅ **Large Models** (>100B params): Model fits in CPU DRAM, not NVIDIA HBM
- * - ✅ **Long Context** (16K+ tokens): Memory bandwidth matters more than compute
- * - ✅ **Mixed Workloads**: CPU can run other services (NVIDIA GPU = dedicated)
- * - ✅ **No Vendor Lock-In**: Avoid CUDA ecosystem dependency
- *
- * **Example: GPT-2 Inference (1024 tokens)**:
- * - NVIDIA RTX 4090: 8ms (PCIe transfer) + 2ms (compute) = **10ms total**
- * - CPU (64-core Xeon): 0ms (model in DRAM) + 5ms (compute) = **5ms total**
- * - **Winner**: CPU (2X faster due to zero transfer overhead)
- *
- * @subsection use_case_training Training Workloads
- *
- * **CPUs Win When**:
- * - ✅ **Small-to-Medium Models** (<10B params): Fits in CPU cache hierarchy
- * - ✅ **Distributed Training**: Network bandwidth > PCIe bandwidth
- * - ✅ **Continuous Learning**: No NVIDIA GPU memory fragmentation over time
- * - ✅ **Cost-Sensitive**: $30K CPU cluster vs $100K+ NVIDIA H100 server
- * - ✅ **Supply Constraints**: NVIDIA GPUs have multi-month lead times
- * - ✅ **Open Ecosystem**: Avoid CUDA lock-in, use standard C/C++
- *
- * **Example: Fine-Tuning GPT-2 (1.5B params)**:
- * - NVIDIA A100 (80GB): 7.2 TFLOPS effective (memory-bound at batch size 1)
- * - CPU (2× 64-core Xeon): 12.3 TFLOPS (DRAM-bound, but 3TB capacity)
- * - **Winner**: Depends on batch size (GPU wins at batch >64, CPU wins at batch <8)
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * @section this_repository What This Repository Demonstrates
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * **Core Innovations**:
- * 1. **Single Contiguous Memory Block**: Eliminates fragmentation, enables hugepages
- * 2. **Token-Level Parallelism**: Perfect for CPU multi-core architectures
- * 3. **Head-Major Attention**: Cache-optimized layout for Q·K^T matmul
- * 4. **AVX-512 Kernels**: Hand-tuned SIMD for 200-500 GFLOPS GEMM performance
- * 5. **Bump Allocator**: Zero-overhead memory management
- * 6. **Hugepage-Backed Memory**: 100X reduction in TLB misses
- *
- * **Measured Performance** (Intel Xeon Gold 6248, 20 cores):
- * - LayerNorm: 7.8X speedup (token-parallel)
- * - GEMM: 474 GFLOPS (cache-blocked, AVX-512)
- * - Attention: 150 GFLOPS (head-major layout)
- * - End-to-end GPT-2 inference: **5ms per token** (1024 context)
- *
- * **Why This Matters**:
- * - Proves CPUs can achieve **GPU-class performance** with proper optimization
- * - Demonstrates **architectural patterns** for CPU-optimized transformers
- * - Provides **educational reference** for systems programming and HPC
- * - Shows path to **cost-effective** LLM deployment at scale
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * @section future The Future: Heterogeneous AI Systems
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * **The industry is moving toward hybrid architectures**:
- * - CPUs for control flow, memory management, long-context processing
- * - NVIDIA GPUs for massive batch processing, training acceleration
- * - Specialized accelerators (AMX, TPU) for specific workloads
- *
- * **This repository demonstrates that CPUs are not a fallback — they are a strategic
- * platform for LLM deployment when optimized correctly.**
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * @section comparison_summary Summary: What We're Really Comparing
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * **The Framing Matters**:
- *
- * ❌ **Misleading**: "GPU vs CPU"
- * - Implies all GPUs are equal
- * - Ignores AMD/Intel GPU irrelevance in AI
- * - Obscures vendor lock-in issues
- *
- * ✅ **Accurate**: "NVIDIA CUDA Ecosystem vs Open CPU Ecosystem"
- * ```
- * NVIDIA Side:                          CPU Side:
- * ├─ Hardware: NVIDIA GPUs only         ├─ Hardware: Intel, AMD, ARM
- * ├─ Software: CUDA (proprietary)       ├─ Software: C/C++ (open standards)
- * ├─ Cost: $25K-40K per card            ├─ Cost: $15K-20K per socket
- * ├─ Memory: 80GB HBM (fixed)           ├─ Memory: 1.5TB DDR5 (expandable)
- * ├─ Portability: CUDA only             ├─ Portability: Runs anywhere
- * └─ Vendor: Single (NVIDIA)            └─ Vendor: Multiple (choice)
- * ```
- *
- * **This Repository's Thesis**:
- *
- * > "When you optimize for **modern server CPUs** using **open standards** (C, AVX-512,
- * > OpenMP), you can achieve **competitive performance** with NVIDIA GPUs for many LLM
- * > workloads — **without vendor lock-in, at lower cost, with more memory capacity.**"
- *
- * **Not**: CPUs are better than all accelerators.
- *
- * **But**: CPUs are a viable, cost-effective, open alternative to **NVIDIA's
- * proprietary ecosystem** — and often the better choice for specific workloads.
- *
- * @section description File Description
- * High-performance LLM runtime engineered for x86-64 CPU architectures.
- * Focuses on CPU-native training and inference with advanced cache-aware optimizations.
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * CPU-OPTIMIZED LARGE LANGUAGE MODEL (LLM) RUNTIME (PURE C)
- * ═══════════════════════════════════════════════════════════════════════════════
- * This project builds a high-performance LLM runtime from first principles in C,
- * engineered for modern x86-64 CPU architectures to excel at both inference and
- * training with microsecond-level latency control.
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * @section memory_architecture MEMORY ARCHITECTURE
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * @subsection single_contiguous_block Single Contiguous Memory Block
- * The entire model (weights, activations, gradients) resides in ONE contiguous
- * memory block allocated via hugepages. This design provides:
- *
- * ✅ **Zero Fragmentation**: Bump allocator ensures sequential, predictable layout
- * ✅ **TLB Efficiency**: 2MB hugepages reduce TLB misses by ~100x vs 4KB pages
- * ✅ **Cache Line Alignment**: Every tensor aligned to 64-byte boundaries
- * ✅ **Memory-Mapped Weights**: Fast model loading via mmap (future)
- * ✅ **NUMA Awareness**: Single allocation simplifies NUMA binding
- *
- * @subsection why_no_interleaving Why We DON'T Interleave Data
- * Traditional interleaved layouts (e.g., [Q0,K0,V0,Q1,K1,V1,...]) cause:
- * ❌ **False Sharing**: Different threads writing adjacent cache lines
- * ❌ **Strided Access**: Poor spatial locality during computation
- * ❌ **Cache Thrashing**: Premature eviction of useful data
- *
- * Instead, we use CONTIGUOUS BLOCKS per tensor:
- * ✅ [Q: all tokens] [K: all tokens] [V: all tokens]
- * ✅ Each thread accesses sequential memory
- * ✅ Hardware prefetcher can predict access patterns
- * ✅ No cache line bouncing between cores
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * @section parallelism_strategies PARALLELISM STRATEGIES
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * @subsection token_level_parallelism Token-Level Parallelism
- * The PRIMARY parallelism strategy. Each CPU core processes a SLICE of tokens:
- *
- * **Memory Layout (Token-Major)**:
- * ```
- * [Token0: 768 floats][Token1: 768 floats]...[TokenN: 768 floats]
- * │<─ Core 0 ──────>││<─ Core 1 ──────>│   │<─ Core 7 ──────>│
- * ```
- *
- * **Benefits**:
- * - ✅ Perfect cache locality (each token's data is contiguous)
- * - ✅ Zero synchronization (tokens are independent)
- * - ✅ Scales linearly with core count
- * - ✅ Works for LayerNorm, GELU, Embeddings, Residuals
- *
- * **Implementation**:
- * - Each core gets `tokens_per_core = context_window / num_cores`
- * - Core ID determines token slice: `token_start = core_id * tokens_per_core`
- * - Access via: `base_ptr + token_idx * aligned_embed_dim`
- *
- * @subsection head_level_parallelism Head-Level Parallelism
- * Used for ATTENTION computation where heads are independent:
- *
- * **Memory Layout (Head-Major)**:
- * ```
- * Head 0: [Token0][Token1]...[TokenN]  ← 64 floats per token
- * Head 1: [Token0][Token1]...[TokenN]  ← 64 floats per token
- * ...
- * Head 11: [Token0][Token1]...[TokenN]
- * │<──────────── Core 0 ──────────────>│
- * ```
- *
- * **Benefits**:
- * - ✅ Each head's Q/K/V data is contiguous (perfect for matmul)
- * - ✅ Attention scores fit in L1 cache (head_size × head_size)
- * - ✅ Parallelizes across heads (12 heads = 12 independent tasks)
- * - ✅ Enables head-wise fusion optimizations
- *
- * **Stride Pattern**:
- * - Head-major stride: `head_stride = context_window * aligned_head_dim`
- * - Token within head: `token_stride = aligned_head_dim`
- * - Access: `base + head_idx * head_stride + token_idx * token_stride + dim`
- *
- * @subsection hybrid_parallelism Hybrid Token + Head Parallelism
- * For operations like QKV projection that produce head-major output:
- * - **Input**: Token-major (LayerNorm output)
- * - **Computation**: Token-parallel (each core processes token slice)
- * - **Output**: Head-major (write with strided pattern)
- *
- * This allows seamless transition between token-parallel and head-parallel stages.
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * @section memory_streams MEMORY ACCESS PATTERNS & STREAMS
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * @subsection streaming_reads Streaming Reads
- * Sequential memory access enables CPU streaming optimizations:
- * - **Hardware Prefetcher**: Detects sequential pattern, preloads cache lines
- * - **Stream Bandwidth**: Achieves 50-100 GB/s per core on modern Xeon
- * - **Cache Bypass**: Large transfers skip cache when beneficial (NT stores)
- *
- * @subsection alignment_critical Alignment is CRITICAL
- * Every tensor is 64-byte aligned to:
- * - ✅ Enable aligned AVX-512 loads (faster than unaligned)
- * - ✅ Prevent cache line splits (one load instead of two)
- * - ✅ Avoid false sharing (each thread owns full cache lines)
- *
- * **Alignment Strategy**:
- * ```c
- * aligned_embed_dim = align_up(768, 64/sizeof(float)) // 768 → 768 (already aligned)
- * aligned_head_dim  = align_up(64, 64/sizeof(float))  // 64 → 64 (already aligned)
- * ```
- *
- * ═══════════════════════════════════════════════════════════════════════════════
- * @section optimization_techniques ADVANCED OPTIMIZATION TECHNIQUES
- * ═══════════════════════════════════════════════════════════════════════════════
- *
- * @subsection avx512_optimization AVX-512 Vectorization
- * - 512-bit SIMD registers (16 floats per instruction)
- * - FMA instructions: 2 FLOPs per cycle per instruction (multiply-add)
- * - Achieves 200-500 GFLOPS on GEMM kernels
- *
- * @subsection cache_blocking Cache Blocking
- * GEMM uses 64×64 blocks to fit in L1 cache (32KB):
- * - Block size chosen to keep working set under 16KB (half of L1)
- * - Reduces DRAM bandwidth by 10-100x
- * - Collapse(3) OpenMP for maximum thread utilization
- *
- * @subsection false_sharing_prevention False Sharing Prevention
- * Padding ensures each thread writes to separate cache lines:
- * - Minimum spacing: 64 bytes (one cache line)
- * - Attention scores padded: `aligned_attn_context_window`
- * - No atomic operations needed for independent writes
- *
- * ═══════════════════════════════════════════════════════════════════════════════
  * @section architecture System Architecture
- * ═══════════════════════════════════════════════════════════════════════════════
- * - **Memory**: Single 2MB hugepage-backed contiguous arena
- * - **Allocator**: Bump allocator with dry-run mode for size estimation
- * - **Parallelism**: OpenMP with static thread-to-core binding
- * - **SIMD**: AVX-512 with FMA (fallback to AVX2 possible)
- * - **Compiler**: GCC/ICC with -O3 -march=native -mavx512f
- * - **Target**: Intel Xeon (Skylake-SP or newer) / AMD EPYC (Zen 4+)
  *
- * @see layout_transformer For detailed memory layout
- * @see transformer_layer_forward For end-to-end data flow
+ * - **Memory**: Single 2MB hugepage-backed contiguous arena.
+ * - **Allocator**: Bump allocator with dry-run mode for size estimation.
+ * - **Parallelism**: OpenMP with static thread-to-core binding.
+ * - **SIMD**: AVX-512 with FMA (fallback to AVX2 possible).
+ * - **Compiler**: GCC/ICC with -O3 -march=native -mavx512f.
+ * - **Target**: Intel Xeon (Skylake-SP or newer) / AMD EPYC (Zen 4+).
+ *
+ * @see layout_transformer For detailed memory layout.
+ * @see transformer_layer_forward For end-to-end data flow.
  */
 
 #define _GNU_SOURCE
