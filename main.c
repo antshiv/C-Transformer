@@ -297,7 +297,6 @@ typedef struct {
     size_t d_v_output_offset;                  // [T × n_heads × H]
     
     // Softmax backward
-    size_t attention_scores_copy_offset;       // [n_heads × T × T] (before softmax)
     size_t d_attention_scores_offset;          // [n_heads × T × T]
     
     // QK^T backward
@@ -657,7 +656,6 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
         L->v_output_copy_offset = bump(&off, T * n_heads * H, CACHE_ALIGN);
         L->d_attention_weights_offset = bump(&off, n_heads * T * T, CACHE_ALIGN);
         L->d_v_output_offset = bump(&off, T * n_heads * H, CACHE_ALIGN);
-        L->attention_scores_copy_offset = bump(&off, n_heads * T * T, CACHE_ALIGN);
         L->d_attention_scores_offset = bump(&off, n_heads * T * T, CACHE_ALIGN);
         L->q_output_copy_offset = bump(&off, T * n_heads * H, CACHE_ALIGN);
         L->k_output_copy_offset = bump(&off, T * n_heads * H, CACHE_ALIGN);
@@ -5609,8 +5607,7 @@ void backward_attention_weighted_values(TransformerModel *M,
  */
 void backward_causal_softmax(TransformerModel *M,
                             size_t d_scores_offset,        // [H×T×T] gradient in/out (reused)
-                            size_t weights_copy_offset,   // [H×T×T] cached softmax output  
-                            size_t scores_copy_offset)     // [H×T×T] cached pre-softmax (unused)
+                            size_t weights_copy_offset)    // [H×T×T] cached softmax output
 {
     float *d_scores_inout = M->memory_base + d_scores_offset;  // Used for both input and output
     float *weights = M->memory_base + weights_copy_offset;
@@ -5968,8 +5965,7 @@ void backward_transformer_layer(TransformerModel *M, int layer_idx) {
     
     // Backward through softmax
     backward_causal_softmax(M, LG->d_attention_scores_offset,
-                            LG->attention_weights_copy_offset,
-                            LG->attention_scores_copy_offset);
+                            LG->attention_weights_copy_offset);
     
     // Backward through Q @ K^T
     backward_qk_matmul(M, LG->d_attention_scores_offset,
@@ -6120,14 +6116,14 @@ void training_step(TransformerModel *M,
     
     // Backward through transformer layers
     for (int layer = M->num_layers - 1; layer >= 0; layer--) {
-      //  backward_transformer_layer(M, layer);
+        backward_transformer_layer(M, layer);
     }
-    
+
     // Backward through initial embeddings (token + positional)
     backward_embedding_layer(M);
-    
+
     // ======== WEIGHT UPDATE ========
-    //update_all_weights_sgd(M, learning_rate);
+    update_all_weights_sgd(M, learning_rate);
 }
 
 void update_all_weights_sgd(TransformerModel *M, float learning_rate) {
