@@ -286,7 +286,9 @@ typedef struct {
     size_t attention_output_copy_offset;       // [T × D]
     size_t proj_weights_copy_offset;           // [D × D]
     size_t proj_bias_copy_offset;              // [D]
-    size_t d_attention_output_offset;          // [T × D]
+    size_t d_attention_output_offset;          // [T × D] gradient from residual path
+    size_t d_attention_token_offset;           // [T × D] token-major gradient after projection backward
+    size_t d_attention_head_offset;            // [n_heads × T × H] head-major gradient for attention mechanism
     size_t d_proj_weights_offset;              // [D × D] accumulator
     size_t d_proj_bias_offset;                 // [D] accumulator
     
@@ -320,6 +322,7 @@ typedef struct {
     size_t d_k_bias_offset;                    // [D] accumulator
     size_t d_v_weights_offset;                 // [D × D] accumulator
     size_t d_v_bias_offset;                    // [D] accumulator
+    size_t qkv_scratch_offset;                 // [T × D] scratch buffer for reshaping
     
     // LayerNorm1
     size_t ln1_input_copy_offset;              // [T × D]
@@ -648,6 +651,8 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
         L->d_residual1_offset = bump(&off, T * D, CACHE_ALIGN);
         L->attention_output_copy_offset = bump(&off, T * D, CACHE_ALIGN);
         L->d_attention_output_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_attention_token_offset = bump(&off, T * D, CACHE_ALIGN);
+        L->d_attention_head_offset = bump(&off, n_heads * T * H, CACHE_ALIGN);
         L->d_proj_weights_offset = bump(&off, D * D, CACHE_ALIGN);
         L->d_proj_bias_offset = bump(&off, D, CACHE_ALIGN);
 
@@ -671,6 +676,7 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
         L->d_k_bias_offset = bump(&off, D, CACHE_ALIGN);
         L->d_v_weights_offset = bump(&off, D * D, CACHE_ALIGN);
         L->d_v_bias_offset = bump(&off, D, CACHE_ALIGN);
+        L->qkv_scratch_offset = bump(&off, T * D, CACHE_ALIGN);
 
         // LayerNorm1 Backward
         L->ln1_input_copy_offset = bump(&off, T * D, CACHE_ALIGN);
@@ -4554,10 +4560,10 @@ void cache_forward_activations(TransformerModel *M) {
                M->memory_base + L->residual2_output_offset,
                M->context_window * M->aligned_embed_dim * sizeof(float));
         
-        // Attention outputs
+        // Attention outputs (token-major [T × D])
         memcpy(M->memory_base + LG->attention_output_copy_offset,
                M->memory_base + L->attention_output_offset,
-               M->num_attention_heads * M->context_window * M->aligned_head_dim * sizeof(float));
+               M->context_window * M->aligned_embed_dim * sizeof(float));
         
         // QKV outputs
         memcpy(M->memory_base + LG->q_output_copy_offset,
@@ -4940,64 +4946,44 @@ void backward_fc2(TransformerModel *M,
     float *d_b_fc2 = M->memory_base + d_bias_offset;
     
     int T = M->context_window;
-    int D = M->aligned_embed_dim;
-    int fourD = 4 * D;
+    int aligned_out = M->aligned_embed_dim;      // D (output dimension, padded)
+    int aligned_in = 4 * M->aligned_embed_dim;   // 4D (input dimension, padded)
     
     // ============================================================================
     // 1. COMPUTE d_input = d_output @ W_fc2^T
-    //    [T × 4D] = [T × D] @ [D × 4D]
+    //    [T × aligned_in] = [T × aligned_out] @ [aligned_out × aligned_in]
+    //    Weight matrix is stored row-major with row stride = aligned_in.
     // ============================================================================
     
     #pragma omp parallel for num_threads(M->num_cores)
     for (int t = 0; t < T; t++) {
-        float *d_out_row = d_output + t * D;
-        float *d_in_row = d_input + t * fourD;
+        float *d_out_row = d_output + t * aligned_out;
+        float *d_in_row = d_input + t * aligned_in;
         
-        // Initialize output row to zero
-        memset(d_in_row, 0, fourD * sizeof(float));
-        
-        // For each element in 4D output
-        for (int j = 0; j < fourD; j++) {
-            __m512 sum_vec = _mm512_setzero_ps();
-            
-            // Vectorized dot product with column j of W_fc2
-            int d;
-            for (d = 0; d <= D - 16; d += 16) {
-                __m512 d_out_vec = _mm512_load_ps(d_out_row + d);
-                __m512 w_vec = _mm512_load_ps(W_fc2 + j * D + d);
-                sum_vec = _mm512_fmadd_ps(d_out_vec, w_vec, sum_vec);
+        for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
+            float sum = 0.0f;
+            for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+                sum += d_out_row[out_idx] * W_fc2[out_idx * aligned_in + in_idx];
             }
-            
-            float sum = _mm512_reduce_add_ps(sum_vec);
-            
-            // Handle remainder
-            for (; d < D; d++) {
-                sum += d_out_row[d] * W_fc2[j * D + d];
-            }
-            
-            d_in_row[j] = sum;
+            d_in_row[in_idx] = sum;
         }
     }
     
     // ============================================================================
-    // 2. COMPUTE d_W_fc2 = fc2_input^T @ d_output
-    //    [4D × D] = [4D × T] @ [T × D]
-    //    Note: We accumulate across all tokens
+    // 2. COMPUTE d_W_fc2 = d_output^T @ fc2_input
+    //    [aligned_out × aligned_in] = [aligned_out × T] @ [T × aligned_in]
     // ============================================================================
     
     #pragma omp parallel for collapse(2) num_threads(M->num_cores)
-    for (int i = 0; i < fourD; i++) {
-        for (int j = 0; j < D; j++) {
+    for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+        for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
             float grad_sum = 0.0f;
-            
-            // Sum over all tokens
             for (int t = 0; t < T; t++) {
-                grad_sum += fc2_input[t * fourD + i] * d_output[t * D + j];
+                grad_sum += d_output[t * aligned_out + out_idx] *
+                            fc2_input[t * aligned_in + in_idx];
             }
-            
-            // Atomic accumulation (in case of multiple backward passes)
             #pragma omp atomic
-            d_W_fc2[i * D + j] += grad_sum;
+            d_W_fc2[out_idx * aligned_in + in_idx] += grad_sum;
         }
     }
     
@@ -5007,12 +4993,12 @@ void backward_fc2(TransformerModel *M,
     // ============================================================================
     
     #pragma omp parallel for num_threads(M->num_cores)
-    for (int d = 0; d < D; d++) {
+    for (int d = 0; d < aligned_out; d++) {
         float bias_grad = 0.0f;
         
         // Sum gradient across all tokens
         for (int t = 0; t < T; t++) {
-            bias_grad += d_output[t * D + d];
+            bias_grad += d_output[t * aligned_out + d];
         }
         
         // Atomic accumulation
@@ -5143,135 +5129,59 @@ void backward_fc1(TransformerModel *M,
     float *d_b_fc1 = M->memory_base + d_bias_offset;
     
     int T = M->context_window;
-    int D = M->aligned_embed_dim;
-    int fourD = 4 * D;
+    int aligned_in = M->aligned_embed_dim;        // Input dimension (padded)
+    int aligned_out = 4 * M->aligned_embed_dim;   // Output dimension (padded)
     
     // ============================================================================
     // 1. COMPUTE d_input = d_output @ W_fc1^T
-    //    [T × D] = [T × 4D] @ [4D × D]
+    //    [T × aligned_in] = [T × aligned_out] @ [aligned_out × aligned_in]
+    //    Weight matrix stored row-major with row stride = aligned_in.
     // ============================================================================
     
     #pragma omp parallel for num_threads(M->num_cores)
     for (int t = 0; t < T; t++) {
-        float *d_out_row = d_output + t * fourD;
-        float *d_in_row = d_input + t * D;
+        float *d_out_row = d_output + t * aligned_out;
+        float *d_in_row = d_input + t * aligned_in;
         
-        // Initialize output row to zero
-        memset(d_in_row, 0, D * sizeof(float));
-        
-        // For each element in D output
-        for (int j = 0; j < D; j++) {
-            __m512 sum_vec = _mm512_setzero_ps();
-            
-            // Vectorized dot product over 4D dimension
-            int i;
-            for (i = 0; i <= fourD - 16; i += 16) {
-                __m512 d_out_vec = _mm512_load_ps(d_out_row + i);
-                // W_fc1 is [D × 4D], so W_fc1[j,i] = W_fc1[j * fourD + i]
-                __m512 w_vec = _mm512_load_ps(W_fc1 + j * fourD + i);
-                sum_vec = _mm512_fmadd_ps(d_out_vec, w_vec, sum_vec);
+        for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
+            float sum = 0.0f;
+            for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+                sum += d_out_row[out_idx] * W_fc1[out_idx * aligned_in + in_idx];
             }
-            
-            float sum = _mm512_reduce_add_ps(sum_vec);
-            
-            // Handle remainder
-            for (; i < fourD; i++) {
-                sum += d_out_row[i] * W_fc1[j * fourD + i];
-            }
-            
-            d_in_row[j] = sum;
+            d_in_row[in_idx] = sum;
         }
     }
     
     // ============================================================================
-    // 2. COMPUTE d_W_fc1 = fc1_input^T @ d_output
-    //    [D × 4D] = [D × T] @ [T × 4D]
-    //    Note: This is the most memory-intensive part
+    // 2. COMPUTE d_W_fc1 = d_output^T @ fc1_input
+    //    [aligned_out × aligned_in] = [aligned_out × T] @ [T × aligned_in]
     // ============================================================================
     
-    // Use blocked computation for better cache usage
-    const int BLOCK_SIZE = 32;  // Tune based on cache size
-    
     #pragma omp parallel for collapse(2) num_threads(M->num_cores)
-    for (int i_block = 0; i_block < D; i_block += BLOCK_SIZE) {
-        for (int j_block = 0; j_block < fourD; j_block += BLOCK_SIZE) {
-            
-            int i_end = (i_block + BLOCK_SIZE < D) ? i_block + BLOCK_SIZE : D;
-            int j_end = (j_block + BLOCK_SIZE < fourD) ? j_block + BLOCK_SIZE : fourD;
-            
-            // Process block
-            for (int i = i_block; i < i_end; i++) {
-                for (int j = j_block; j < j_end; j++) {
-                    float grad_sum = 0.0f;
-                    
-                    // Vectorized sum over tokens
-                    int t;
-                    __m512 sum_vec = _mm512_setzero_ps();
-                    
-                    // Process 16 tokens at a time using gather operations
-                    for (t = 0; t <= T - 16; t += 16) {
-                        // Gather fc1_input[t,i] for 16 tokens
-                        float input_vals[16];
-                        float output_vals[16];
-                        
-                        for (int k = 0; k < 16; k++) {
-                            input_vals[k] = fc1_input[(t+k) * D + i];
-                            output_vals[k] = d_output[(t+k) * fourD + j];
-                        }
-                        
-                        __m512 in_vec = _mm512_load_ps(input_vals);
-                        __m512 out_vec = _mm512_load_ps(output_vals);
-                        sum_vec = _mm512_fmadd_ps(in_vec, out_vec, sum_vec);
-                    }
-                    
-                    grad_sum = _mm512_reduce_add_ps(sum_vec);
-                    
-                    // Handle remainder tokens
-                    for (; t < T; t++) {
-                        grad_sum += fc1_input[t * D + i] * d_output[t * fourD + j];
-                    }
-                    
-                    // Atomic accumulation
-                    #pragma omp atomic
-                    d_W_fc1[i * fourD + j] += grad_sum;
-                }
+    for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+        for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
+            float grad_sum = 0.0f;
+            for (int t = 0; t < T; t++) {
+                grad_sum += d_output[t * aligned_out + out_idx] *
+                            fc1_input[t * aligned_in + in_idx];
             }
+            #pragma omp atomic
+            d_W_fc1[out_idx * aligned_in + in_idx] += grad_sum;
         }
     }
     
     // ============================================================================
     // 3. COMPUTE d_b_fc1 = sum_over_T(d_output)
-    //    [4D] = sum over token dimension of [T × 4D]
     // ============================================================================
     
     #pragma omp parallel for num_threads(M->num_cores)
-    for (int j = 0; j < fourD; j++) {
+    for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
         float bias_grad = 0.0f;
-        
-        // Vectorized sum across tokens
-        int t;
-        __m512 sum_vec = _mm512_setzero_ps();
-        
-        // Process multiple tokens at once using strided access
-        for (t = 0; t <= T - 16; t += 16) {
-            float vals[16];
-            for (int k = 0; k < 16; k++) {
-                vals[k] = d_output[(t+k) * fourD + j];
-            }
-            __m512 d_vec = _mm512_load_ps(vals);
-            sum_vec = _mm512_add_ps(sum_vec, d_vec);
+        for (int t = 0; t < T; t++) {
+            bias_grad += d_output[t * aligned_out + out_idx];
         }
-        
-        bias_grad = _mm512_reduce_add_ps(sum_vec);
-        
-        // Handle remainder
-        for (; t < T; t++) {
-            bias_grad += d_output[t * fourD + j];
-        }
-        
-        // Atomic accumulation
         #pragma omp atomic
-        d_b_fc1[j] += bias_grad;
+        d_b_fc1[out_idx] += bias_grad;
     }
 }
 
@@ -5451,75 +5361,85 @@ void backward_attention_projection(TransformerModel *M,
                                   size_t attention_output_copy_offset, // [T×D] cached attention output
                                   size_t proj_weight_offset,        // [D×D] projection weights
                                   size_t proj_bias_offset,          // [D] projection bias
-                                  size_t d_attention_offset,        // [T×D] gradient to compute
+                                  size_t d_attention_token_offset,  // [T×D] token-major gradient
+                                  size_t d_attention_head_offset,   // [H×T×H] head-major gradient
                                   size_t d_weight_offset,           // [D×D] weight gradient to accumulate
                                   size_t d_bias_offset)             // [D] bias gradient to accumulate
 {
     float *d_output = M->memory_base + d_output_offset;
     float *attention_output = M->memory_base + attention_output_copy_offset;
     float *W_proj = M->memory_base + proj_weight_offset;
-    float *d_attention = M->memory_base + d_attention_offset;
+    float *d_attention_token = M->memory_base + d_attention_token_offset;
+    float *d_attention_heads = M->memory_base + d_attention_head_offset;
     float *d_W_proj = M->memory_base + d_weight_offset;
     float *d_b_proj = M->memory_base + d_bias_offset;
     
     int T = M->context_window;
-    int D = M->aligned_embed_dim;
+    int aligned_dim = M->aligned_embed_dim;
+    int embed_dim = M->embed_dim;
+    int head_dim = M->head_dim;
+    int aligned_head_dim = M->aligned_head_dim;
+    int H = M->num_attention_heads;
     
-    // 1. Compute d_attention = d_output @ W_proj^T
-    //    [T×D] = [T×D] @ [D×D]
+    // 1. Compute token-major gradient: d_attention = d_output @ W_proj^T
     #pragma omp parallel for num_threads(M->num_cores)
     for (int t = 0; t < T; t++) {
-        float *d_out_row = d_output + t * D;
-        float *d_att_row = d_attention + t * D;
+        float *d_out_row = d_output + t * aligned_dim;
+        float *d_att_row = d_attention_token + t * aligned_dim;
         
-        memset(d_att_row, 0, D * sizeof(float));
-        
-        for (int j = 0; j < M->embed_dim; j++) {
-            __m512 sum_vec = _mm512_setzero_ps();
-            
-            int i;
-            for (i = 0; i <= M->embed_dim - 16; i += 16) {
-                __m512 d_out_vec = _mm512_load_ps(d_out_row + i);
-                // W_proj[j,i] for transpose
-                __m512 w_vec = _mm512_load_ps(W_proj + j * D + i);
-                sum_vec = _mm512_fmadd_ps(d_out_vec, w_vec, sum_vec);
+        for (int col = 0; col < aligned_dim; col++) {
+            float sum = 0.0f;
+            for (int row = 0; row < aligned_dim; row++) {
+                sum += d_out_row[row] * W_proj[row * aligned_dim + col];
             }
-            
-            float sum = _mm512_reduce_add_ps(sum_vec);
-            
-            for (; i < M->embed_dim; i++) {
-                sum += d_out_row[i] * W_proj[j * D + i];
-            }
-            
-            d_att_row[j] = sum;
+            d_att_row[col] = sum;
         }
     }
     
-    // 2. Compute d_W_proj = attention^T @ d_output
-    //    [D×D] = [D×T] @ [T×D]
+    // 2. Convert token-major gradient to head-major layout
     #pragma omp parallel for collapse(2) num_threads(M->num_cores)
-    for (int i = 0; i < M->embed_dim; i++) {
-        for (int j = 0; j < M->embed_dim; j++) {
-            float grad_sum = 0.0f;
-            
-            for (int t = 0; t < T; t++) {
-                grad_sum += attention_output[t * D + i] * d_output[t * D + j];
+    for (int h = 0; h < H; h++) {
+        for (int t = 0; t < T; t++) {
+            for (int d = 0; d < aligned_head_dim; d++) {
+                float value = 0.0f;
+                if (d < head_dim) {
+                    int global_dim = h * head_dim + d;
+                    if (global_dim < aligned_dim) {
+                        value = d_attention_token[t * aligned_dim + global_dim];
+                    }
+                }
+                Q_ACCESS(d_attention_heads, h, t, d, T, aligned_head_dim) = value;
             }
-            
-            #pragma omp atomic
-            d_W_proj[i * D + j] += grad_sum;
+        }
+    }
+
+    // Zero padded dimensions in token-major buffer
+    for (int t = 0; t < T; t++) {
+        for (int d = embed_dim; d < aligned_dim; d++) {
+            d_attention_token[t * aligned_dim + d] = 0.0f;
         }
     }
     
-    // 3. Compute d_b_proj = sum(d_output) over T
-    #pragma omp parallel for num_threads(M->num_cores)
-    for (int d = 0; d < M->embed_dim; d++) {
-        float bias_grad = 0.0f;
-        
-        for (int t = 0; t < T; t++) {
-            bias_grad += d_output[t * D + d];
+    // 3. Compute d_W_proj = attention^T @ d_output
+    #pragma omp parallel for collapse(2) num_threads(M->num_cores)
+    for (int row = 0; row < aligned_dim; row++) {
+        for (int col = 0; col < aligned_dim; col++) {
+            float grad_sum = 0.0f;
+            for (int t = 0; t < T; t++) {
+                grad_sum += attention_output[t * aligned_dim + col] * d_output[t * aligned_dim + row];
+            }
+            #pragma omp atomic
+            d_W_proj[row * aligned_dim + col] += grad_sum;
         }
-        
+    }
+    
+    // 4. Compute d_b_proj = sum(d_output) over tokens
+    #pragma omp parallel for num_threads(M->num_cores)
+    for (int d = 0; d < aligned_dim; d++) {
+        float bias_grad = 0.0f;
+        for (int t = 0; t < T; t++) {
+            bias_grad += d_output[t * aligned_dim + d];
+        }
         #pragma omp atomic
         d_b_proj[d] += bias_grad;
     }
@@ -5732,7 +5652,8 @@ void backward_linear(TransformerModel *M,
                     size_t bias_offset,        // [D] bias
                     size_t d_input_offset,     // [T×D] gradient to accumulate
                     size_t d_weight_offset,    // [D×D] weight gradient
-                    size_t d_bias_offset)      // [D] bias gradient
+                    size_t d_bias_offset,      // [D] bias gradient
+                    size_t scratch_offset)     // [T×D] scratch buffer
 {
     float *d_output = M->memory_base + d_output_offset;
     float *input = M->memory_base + input_copy_offset;
@@ -5740,68 +5661,76 @@ void backward_linear(TransformerModel *M,
     float *d_input = M->memory_base + d_input_offset;
     float *d_weights = M->memory_base + d_weight_offset;
     float *d_bias = M->memory_base + d_bias_offset;
+    float *scratch = M->memory_base + scratch_offset; // [T × D] buffer for reshaping
     
     int T = M->context_window;
-    int D = M->aligned_embed_dim;
+    int aligned_dim = M->aligned_embed_dim;
+    int embed_dim = M->embed_dim;
+    int head_dim = M->head_dim;
+    int aligned_head_dim = M->aligned_head_dim;
+    int H = M->num_attention_heads;
     
-    // First, convert d_output from head-major to token-major if needed
-    // For QKV backward, d_output is [H×T×head_dim], need to reshape to [T×D]
-    float *d_output_reshaped = M->memory_base + M->gradients.d_pos_embed_offset; // Reuse scratch
-    
-    // Reshape from head-major to token-major
-    #pragma omp parallel for collapse(2)
+    // Reshape from head-major [H×T×head_dim] to token-major [T×D]
+    #pragma omp parallel for collapse(2) num_threads(M->num_cores)
     for (int t = 0; t < T; t++) {
-        for (int h = 0; h < M->num_attention_heads; h++) {
-            for (int d = 0; d < M->head_dim; d++) {
-                int global_dim = h * M->head_dim + d;
-                float value = Q_ACCESS(d_output, h, t, d, T, M->aligned_head_dim);
-                d_output_reshaped[t * D + global_dim] = value;
+        for (int h = 0; h < H; h++) {
+            for (int d = 0; d < head_dim; d++) {
+                int global_dim = h * head_dim + d;
+                scratch[t * aligned_dim + global_dim] =
+                    Q_ACCESS(d_output, h, t, d, T, aligned_head_dim);
             }
         }
     }
+
+    // Zero padding lanes that do not correspond to real model dims
+    #pragma omp parallel for num_threads(M->num_cores)
+    for (int t = 0; t < T; t++) {
+        for (int d = embed_dim; d < aligned_dim; d++) {
+            scratch[t * aligned_dim + d] = 0.0f;
+        }
+    }
+    
+    int aligned_out = aligned_dim;  // Output dim equals input dim for Q/K/V projections
+    int aligned_in = aligned_dim;
     
     // 1. d_input = d_output @ W^T (accumulate!)
     #pragma omp parallel for num_threads(M->num_cores)
     for (int t = 0; t < T; t++) {
-        for (int i = 0; i < M->embed_dim; i++) {
+        float *d_out_row = scratch + t * aligned_out;
+        float *d_in_row = d_input + t * aligned_in;
+        
+        for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
             float sum = 0.0f;
-            
-            for (int j = 0; j < M->embed_dim; j++) {
-                sum += d_output_reshaped[t * D + j] * weights[i * D + j];
+            for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+                sum += d_out_row[out_idx] * weights[out_idx * aligned_in + in_idx];
             }
-            
-            // Accumulate (important for QKV which all contribute to LN1 gradient)
             #pragma omp atomic
-            d_input[t * D + i] += sum;
+            d_in_row[in_idx] += sum;
         }
     }
     
-    // 2. d_W = input^T @ d_output
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < M->embed_dim; i++) {
-        for (int j = 0; j < M->embed_dim; j++) {
+    // 2. d_W = input^T @ d_output  (matches forward row-major layout: [out][in])
+    #pragma omp parallel for collapse(2) num_threads(M->num_cores)
+    for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+        for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
             float sum = 0.0f;
-            
             for (int t = 0; t < T; t++) {
-                sum += input[t * D + i] * d_output_reshaped[t * D + j];
+                sum += input[t * aligned_in + in_idx] * scratch[t * aligned_out + out_idx];
             }
-            
             #pragma omp atomic
-            d_weights[i * D + j] += sum;
+            d_weights[out_idx * aligned_in + in_idx] += sum;
         }
     }
     
     // 3. d_bias = sum(d_output)
-    #pragma omp parallel for
-    for (int d = 0; d < M->embed_dim; d++) {
+    #pragma omp parallel for num_threads(M->num_cores)
+    for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
         float sum = 0.0f;
-        
         for (int t = 0; t < T; t++) {
-            sum += d_output_reshaped[t * D + d];
+            sum += scratch[t * aligned_out + out_idx];
         }
-        
         #pragma omp atomic
-        d_bias[d] += sum;
+        d_bias[out_idx] += sum;
     }
 }
 
@@ -5948,7 +5877,8 @@ void backward_transformer_layer(TransformerModel *M, int layer_idx) {
     backward_attention_projection(M, LG->d_attention_output_offset,
                                   LG->attention_output_copy_offset,
                                   L->proj_weight_offset, L->proj_bias_offset,
-                                  LG->d_attention_weights_offset,  // Input to projection
+                                  LG->d_attention_token_offset,
+                                  LG->d_attention_head_offset,
                                   LG->d_proj_weights_offset,
                                   LG->d_proj_bias_offset);
     
@@ -5957,18 +5887,18 @@ void backward_transformer_layer(TransformerModel *M, int layer_idx) {
     // ============================================================================
     
     // Backward through attention weights × V
-    backward_attention_weighted_values(M, LG->d_attention_weights_offset,
+    backward_attention_weighted_values(M, LG->d_attention_head_offset,
                                        LG->attention_weights_copy_offset,
                                        LG->v_output_copy_offset,
-                                       LG->d_attention_scores_offset,
+                                       LG->d_attention_weights_offset,
                                        LG->d_v_output_offset);
     
     // Backward through softmax
-    backward_causal_softmax(M, LG->d_attention_scores_offset,
+    backward_causal_softmax(M, LG->d_attention_weights_offset,
                             LG->attention_weights_copy_offset);
     
     // Backward through Q @ K^T
-    backward_qk_matmul(M, LG->d_attention_scores_offset,
+    backward_qk_matmul(M, LG->d_attention_weights_offset,
                       LG->q_output_copy_offset,
                       LG->k_output_copy_offset,
                       LG->d_q_output_offset,
@@ -5982,19 +5912,22 @@ void backward_transformer_layer(TransformerModel *M, int layer_idx) {
     backward_linear(M, LG->d_q_output_offset, LG->ln1_output_copy_offset,
                    L->q_weight_offset, L->q_bias_offset,
                    LG->d_ln1_output_offset,  // Accumulates to LN1 output
-                   LG->d_q_weights_offset, LG->d_q_bias_offset);
+                   LG->d_q_weights_offset, LG->d_q_bias_offset,
+                   LG->qkv_scratch_offset);
     
     // K projection
     backward_linear(M, LG->d_k_output_offset, LG->ln1_output_copy_offset,
                    L->k_weight_offset, L->k_bias_offset,
                    LG->d_ln1_output_offset,  // Accumulates to LN1 output
-                   LG->d_k_weights_offset, LG->d_k_bias_offset);
+                   LG->d_k_weights_offset, LG->d_k_bias_offset,
+                   LG->qkv_scratch_offset);
     
     // V projection
     backward_linear(M, LG->d_v_output_offset, LG->ln1_output_copy_offset,
                    L->v_weight_offset, L->v_bias_offset,
                    LG->d_ln1_output_offset,  // Accumulates to LN1 output
-                   LG->d_v_weights_offset, LG->d_v_bias_offset);
+                   LG->d_v_weights_offset, LG->d_v_bias_offset,
+                   LG->qkv_scratch_offset);
     
     // ============================================================================
     // BACKWARD THROUGH FIRST LAYERNORM
@@ -6069,6 +6002,8 @@ void compute_cross_entropy_loss(TransformerModel *M,
     *loss_out = total_loss / M->context_window;
 }
 
+void update_all_weights_sgd(TransformerModel *M, float learning_rate);
+
 void training_step(TransformerModel *M, 
                    int32_t *input_tokens,
                    int32_t *target_tokens,
@@ -6127,40 +6062,106 @@ void training_step(TransformerModel *M,
 }
 
 void update_all_weights_sgd(TransformerModel *M, float learning_rate) {
-    // Update embeddings
-    for (size_t i = 0; i < M->vocab_size * M->aligned_embed_dim; i++) {
-        M->memory_base[M->token_emb_offset + i] -= 
+    size_t aligned_dim = M->aligned_embed_dim;
+    size_t aligned_fc = 4 * aligned_dim;
+    
+    // Update token embeddings (shared with LM head)
+    for (size_t i = 0; i < (size_t)M->vocab_size * aligned_dim; i++) {
+        M->memory_base[M->token_emb_offset + i] -=
             learning_rate * M->memory_base[M->gradients.d_embed_weights_offset + i];
     }
     
     // Update positional embeddings
-    for (size_t i = 0; i < M->context_window * M->aligned_embed_dim; i++) {
-        M->memory_base[M->pos_emb_offset + i] -= 
+    for (size_t i = 0; i < (size_t)M->context_window * aligned_dim; i++) {
+        M->memory_base[M->pos_emb_offset + i] -=
             learning_rate * M->memory_base[M->gradients.d_pos_embed_offset + i];
     }
     
-    // Update each layer
+    // Update each transformer layer
     for (int l = 0; l < M->num_layers; l++) {
         LayerGradients *LG = &M->gradients.layers[l];
         TrulyOptimalLayer *L = &M->layers[l];
         
-        // Update LayerNorm1
-        for (int i = 0; i < M->embed_dim; i++) {
-            M->memory_base[L->ln1_weight_offset + i] -= 
+        // LayerNorm 1 parameters
+        for (size_t i = 0; i < aligned_dim; i++) {
+            M->memory_base[L->ln1_weight_offset + i] -=
                 learning_rate * M->memory_base[LG->d_ln1_gamma_offset + i];
-            M->memory_base[L->ln1_bias_offset + i] -= 
+            M->memory_base[L->ln1_bias_offset + i] -=
                 learning_rate * M->memory_base[LG->d_ln1_beta_offset + i];
         }
         
-        // Update Q, K, V weights and biases
-        // ... continue for all parameters
+        // Q weights/bias
+        for (size_t i = 0; i < aligned_dim * aligned_dim; i++) {
+            M->memory_base[L->q_weight_offset + i] -=
+                learning_rate * M->memory_base[LG->d_q_weights_offset + i];
+        }
+        for (size_t i = 0; i < aligned_dim; i++) {
+            M->memory_base[L->q_bias_offset + i] -=
+                learning_rate * M->memory_base[LG->d_q_bias_offset + i];
+        }
+        
+        // K weights/bias
+        for (size_t i = 0; i < aligned_dim * aligned_dim; i++) {
+            M->memory_base[L->k_weight_offset + i] -=
+                learning_rate * M->memory_base[LG->d_k_weights_offset + i];
+        }
+        for (size_t i = 0; i < aligned_dim; i++) {
+            M->memory_base[L->k_bias_offset + i] -=
+                learning_rate * M->memory_base[LG->d_k_bias_offset + i];
+        }
+        
+        // V weights/bias
+        for (size_t i = 0; i < aligned_dim * aligned_dim; i++) {
+            M->memory_base[L->v_weight_offset + i] -=
+                learning_rate * M->memory_base[LG->d_v_weights_offset + i];
+        }
+        for (size_t i = 0; i < aligned_dim; i++) {
+            M->memory_base[L->v_bias_offset + i] -=
+                learning_rate * M->memory_base[LG->d_v_bias_offset + i];
+        }
+        
+        // Projection weights/bias
+        for (size_t i = 0; i < aligned_dim * aligned_dim; i++) {
+            M->memory_base[L->proj_weight_offset + i] -=
+                learning_rate * M->memory_base[LG->d_proj_weights_offset + i];
+        }
+        for (size_t i = 0; i < aligned_dim; i++) {
+            M->memory_base[L->proj_bias_offset + i] -=
+                learning_rate * M->memory_base[LG->d_proj_bias_offset + i];
+        }
+        
+        // LayerNorm 2 parameters
+        for (size_t i = 0; i < aligned_dim; i++) {
+            M->memory_base[L->ln2_weight_offset + i] -=
+                learning_rate * M->memory_base[LG->d_ln2_gamma_offset + i];
+            M->memory_base[L->ln2_bias_offset + i] -=
+                learning_rate * M->memory_base[LG->d_ln2_beta_offset + i];
+        }
+        
+        // MLP weights/biases (FC1 expands to 4D, FC2 contracts back)
+        for (size_t i = 0; i < aligned_dim * aligned_fc; i++) {
+            M->memory_base[L->fc1_weight_offset + i] -=
+                learning_rate * M->memory_base[LG->d_fc1_weights_offset + i];
+        }
+        for (size_t i = 0; i < aligned_fc; i++) {
+            M->memory_base[L->fc1_bias_offset + i] -=
+                learning_rate * M->memory_base[LG->d_fc1_bias_offset + i];
+        }
+        for (size_t i = 0; i < aligned_fc * aligned_dim; i++) {
+            M->memory_base[L->fc2_weight_offset + i] -=
+                learning_rate * M->memory_base[LG->d_fc2_weights_offset + i];
+        }
+        for (size_t i = 0; i < aligned_dim; i++) {
+            M->memory_base[L->fc2_bias_offset + i] -=
+                learning_rate * M->memory_base[LG->d_fc2_bias_offset + i];
+        }
     }
     
-    // Update final layernorm
-    for (int i = 0; i < M->embed_dim; i++) {
-        M->memory_base[M->final_ln_weight_offset + i] -= 
+    // Update final layernorm parameters
+    for (size_t i = 0; i < aligned_dim; i++) {
+        M->memory_base[M->final_ln_weight_offset + i] -=
             learning_rate * M->memory_base[M->gradients.d_final_ln_gamma_offset + i];
-        M->memory_base[M->final_ln_bias_offset + i] -= 
+        M->memory_base[M->final_ln_bias_offset + i] -=
             learning_rate * M->memory_base[M->gradients.d_final_ln_beta_offset + i];
     }
 }
