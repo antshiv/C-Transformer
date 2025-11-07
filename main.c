@@ -86,6 +86,7 @@
 /* MEMORY OVERFLOW MACROS */
 #define CANARY_SIZE_FLOATS 16 // 64 bytes, one cache line
 #define FINAL_CANARY_ZONE_FLOATS 1024 // Reserve 4KB at the very end
+#define CANARY_VALUE 1234567.0f
 
 /* ============================================================================
    HEAD-MAJOR ACCESS MACROS
@@ -367,6 +368,7 @@ typedef struct {
     LayerGradients* layers;         // Array of per-layer gradient structs
     
     size_t d_pos_embed_offset;                 // [T × D] positional embedding gradients
+    size_t training_pair_tokens_offset;        // [T+1] token buffer for training data loader
     
     size_t layer_backprop_stride;              // Distance between layers
     
@@ -691,6 +693,13 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
     
     // 5. Embeddings (last in backward)
     M->gradients.d_pos_embed_offset = bump(&off, T * D, CACHE_ALIGN);
+    
+    if (M->training_enabled) {
+        size_t tokens_needed = (size_t)T + 1; // input context + next-token target
+        M->gradients.training_pair_tokens_offset = bump(&off, tokens_needed, CACHE_ALIGN);
+    } else {
+        M->gradients.training_pair_tokens_offset = 0;
+    }
     // M->gradients.d_embed_weights_offset  <- embed weigths is again used but we have allcoated this pointer above. 
     
     // Update total gradient floats
@@ -882,6 +891,121 @@ void destroy_transformer(TransformerModel *M)
     if (M->training_enabled  && M->gradients.layers) {
         free(M->gradients.layers);
     }
+}
+
+static inline float randf_symmetric(float scale) {
+    return (2.0f * ((float)rand() / (float)RAND_MAX) - 1.0f) * scale;
+}
+
+static void fill_random_tensor(float *dst, size_t count, float scale) {
+    for (size_t i = 0; i < count; ++i) {
+        dst[i] = randf_symmetric(scale);
+    }
+}
+
+static void set_tensor_value(float *dst, size_t count, float value) {
+    for (size_t i = 0; i < count; ++i) {
+        dst[i] = value;
+    }
+}
+
+static unsigned int initialize_model_weights(TransformerModel *M) {
+    unsigned int seed = (unsigned int)time(NULL);
+    srand(seed);
+    
+    size_t total_bytes = M->total_floats * sizeof(float);
+    memset(M->memory_base, 0, total_bytes);
+    
+    size_t aligned_dim = M->aligned_embed_dim;
+    size_t aligned_fc = 4 * aligned_dim;
+    float weight_scale = 0.02f;
+    
+    fill_random_tensor(M->memory_base + M->token_emb_offset,
+                       (size_t)M->vocab_size * aligned_dim,
+                       weight_scale);
+    fill_random_tensor(M->memory_base + M->pos_emb_offset,
+                       (size_t)M->context_window * aligned_dim,
+                       weight_scale);
+    
+    for (int l = 0; l < M->num_layers; ++l) {
+        TrulyOptimalLayer *L = &M->layers[l];
+        
+        fill_random_tensor(M->memory_base + L->q_weight_offset,
+                           (size_t)aligned_dim * aligned_dim,
+                           weight_scale);
+        fill_random_tensor(M->memory_base + L->k_weight_offset,
+                           (size_t)aligned_dim * aligned_dim,
+                           weight_scale);
+        fill_random_tensor(M->memory_base + L->v_weight_offset,
+                           (size_t)aligned_dim * aligned_dim,
+                           weight_scale);
+        fill_random_tensor(M->memory_base + L->proj_weight_offset,
+                           (size_t)aligned_dim * aligned_dim,
+                           weight_scale);
+        fill_random_tensor(M->memory_base + L->fc1_weight_offset,
+                           (size_t)aligned_fc * aligned_dim,
+                           weight_scale);
+        fill_random_tensor(M->memory_base + L->fc2_weight_offset,
+                           (size_t)aligned_fc * aligned_dim,
+                           weight_scale);
+        
+        set_tensor_value(M->memory_base + L->ln1_weight_offset, aligned_dim, 1.0f);
+        set_tensor_value(M->memory_base + L->ln2_weight_offset, aligned_dim, 1.0f);
+    }
+    
+    set_tensor_value(M->memory_base + M->final_ln_weight_offset, aligned_dim, 1.0f);
+    return seed;
+}
+
+static void fill_canary_region(float *ptr, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        ptr[i] = CANARY_VALUE;
+    }
+}
+
+static bool check_canary_region(const float *ptr, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (ptr[i] != CANARY_VALUE) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void initialize_canaries(TransformerModel *M) {
+    float *base = M->memory_base;
+    for (int l = 0; l < M->num_layers; ++l) {
+        TrulyOptimalLayer *L = &M->layers[l];
+        fill_canary_region(base + L->layer_start_canary_offset, CANARY_SIZE_FLOATS);
+        fill_canary_region(base + L->layer_end_canary_offset, CANARY_SIZE_FLOATS);
+    }
+    float *final_zone = base + (M->total_floats - FINAL_CANARY_ZONE_FLOATS);
+    fill_canary_region(final_zone, FINAL_CANARY_ZONE_FLOATS);
+}
+
+static bool verify_canaries(TransformerModel *M, const char *stage) {
+    bool ok = true;
+    float *base = M->memory_base;
+    
+    for (int l = 0; l < M->num_layers; ++l) {
+        TrulyOptimalLayer *L = &M->layers[l];
+        if (!check_canary_region(base + L->layer_start_canary_offset, CANARY_SIZE_FLOATS)) {
+            fprintf(stderr, "❌ Canary corruption detected at layer %d start (stage: %s)\n", l, stage);
+            ok = false;
+        }
+        if (!check_canary_region(base + L->layer_end_canary_offset, CANARY_SIZE_FLOATS)) {
+            fprintf(stderr, "❌ Canary corruption detected at layer %d end (stage: %s)\n", l, stage);
+            ok = false;
+        }
+    }
+    
+    float *final_zone = base + (M->total_floats - FINAL_CANARY_ZONE_FLOATS);
+    if (!check_canary_region(final_zone, FINAL_CANARY_ZONE_FLOATS)) {
+        fprintf(stderr, "❌ Canary corruption detected in final guard region (stage: %s)\n", stage);
+        ok = false;
+    }
+    
+    return ok;
 }
 
 // Calculate memory requirements
@@ -6091,9 +6215,7 @@ static bool build_training_pair_list(const char *dir_path, TrainingPairList *out
 
 static bool load_training_window(const char *file_path,
                                  int context_len,
-                                 int32_t *input_tokens,
-                                 int32_t *target_tokens,
-                                 uint32_t *scratch) {
+                                 uint32_t *buffer) {
     size_t total = (size_t)context_len + 1;
     FILE *fp = fopen(file_path, "rb");
     if (!fp) {
@@ -6101,17 +6223,12 @@ static bool load_training_window(const char *file_path,
         return false;
     }
     
-    size_t read = fread(scratch, sizeof(uint32_t), total, fp);
+    size_t read = fread(buffer, sizeof(uint32_t), total, fp);
     fclose(fp);
     
     if (read != total) {
         fprintf(stderr, "❌ Expected %zu tokens in '%s' but read %zu\n", total, file_path, read);
         return false;
-    }
-    
-    for (int i = 0; i < context_len; ++i) {
-        input_tokens[i] = (int32_t)scratch[i];
-        target_tokens[i] = (int32_t)scratch[i + 1];
     }
     return true;
 }
@@ -6130,6 +6247,11 @@ static void run_training_loop(TransformerModel *M,
     if (!build_training_pair_list(train_dir, &list)) {
         return;
     }
+    if (M->gradients.training_pair_tokens_offset == 0) {
+        fprintf(stderr, "❌ Training buffers not allocated. Ensure training mode is enabled before layout.\n");
+        free_training_pair_list(&list);
+        return;
+    }
     
     if (total_steps <= 0) {
         total_steps = (int)list.count;
@@ -6141,32 +6263,35 @@ static void run_training_loop(TransformerModel *M,
         learning_rate = 1e-4f;
     }
     
-    int32_t *input_tokens = (int32_t *)malloc((size_t)M->context_window * sizeof(int32_t));
-    int32_t *target_tokens = (int32_t *)malloc((size_t)M->context_window * sizeof(int32_t));
-    uint32_t *scratch = (uint32_t *)malloc(((size_t)M->context_window + 1) * sizeof(uint32_t));
-    
-    if (!input_tokens || !target_tokens || !scratch) {
-        fprintf(stderr, "❌ Failed to allocate buffers for training loop\n");
-        free(input_tokens);
-        free(target_tokens);
-        free(scratch);
-        free_training_pair_list(&list);
-        return;
-    }
+    uint32_t *pair_tokens_u32 = (uint32_t *)(M->memory_base + M->gradients.training_pair_tokens_offset);
+    int32_t *input_tokens = (int32_t *)pair_tokens_u32;
+    int32_t *target_tokens = input_tokens + 1;
     
     size_t pair_index = 0;
     printf("\n🎯 Starting training loop (%d steps, lr=%.6f) using data at %s\n",
            total_steps, learning_rate, train_dir);
     
+    bool canary_verified_once = false;
+    
     for (int step = 0; step < total_steps; ++step) {
         const char *pair_path = list.paths[pair_index];
         pair_index = (pair_index + 1) % list.count;
         
-        if (!load_training_window(pair_path, M->context_window, input_tokens, target_tokens, scratch)) {
+        if (!load_training_window(pair_path, M->context_window, pair_tokens_u32)) {
             continue;
         }
         
         float loss = training_step(M, input_tokens, target_tokens, learning_rate);
+        
+        if (!canary_verified_once) {
+            if (!verify_canaries(M, "first training step")) {
+                fprintf(stderr, "💥 Aborting due to memory canary corruption.\n");
+                exit(EXIT_FAILURE);
+            }
+            canary_verified_once = true;
+            printf("🛡️  Canary check passed after first training step.\n");
+        }
+        
         if ((step + 1) % log_interval == 0 || step == 0) {
             float ppl = expf(loss);
             printf("[train] step=%d/%d  loss=%.6f  perplexity=%.2f  sample=%s\n",
@@ -6176,9 +6301,6 @@ static void run_training_loop(TransformerModel *M,
     
     printf("✅ Training complete.\n");
     
-    free(input_tokens);
-    free(target_tokens);
-    free(scratch);
     free_training_pair_list(&list);
 }
 
@@ -6497,6 +6619,18 @@ int main(int argc, char **argv)
     layout_transformer(&M, M.training_enabled);
     printf("✅ Success! mmap at %p, %.2f GiB reserved.\n",
            (void *)M.memory_base, need_gib);
+
+    if (!weight_file) {
+        printf("🎲 Initializing random weights (seed=%u)...\n", (unsigned int)time(NULL));
+        initialize_model_weights(&M);
+
+        // DEBUG: Check if weights are non-zero
+        float *emb_weights = M.memory_base + M.token_emb_offset;
+        printf("   Sample weights: [0]=%.6f [1]=%.6f [2]=%.6f\n",
+               emb_weights[0], emb_weights[1], emb_weights[2]);
+    } else {
+        printf("📂 Loading weights from: %s\n", weight_file);
+    }
     
     /* Setup execution plan */
     long logical_cores = sysconf(_SC_NPROCESSORS_ONLN);
@@ -6524,25 +6658,33 @@ int main(int argc, char **argv)
     }
 
     if (weight_file) {
-        srand(time(NULL));
-        load_model_weights(&M, weight_file);
+        printf("📂 Loading weights from: %s\n", weight_file);
+        if (load_model_weights(&M, weight_file) != 0) {
+            destroy_transformer(&M);
+            return 1;
+        }
+        printf("✅ Weights loaded successfully\n");
+    } else {
+        unsigned int seed_used = initialize_model_weights(&M);
+        float *emb_weights = M.memory_base + M.token_emb_offset;
+        float accum = 0.0f;
+        for (int i = 0; i < 8; ++i) {
+            accum += emb_weights[i] * emb_weights[i];
+        }
+        printf("🎲 Random weight init (seed=%u), embedding norm sample=%.6f\n",
+               seed_used, sqrtf(accum));
+    }
+    initialize_canaries(&M);
+
+    if (weight_file && !train_dir) {
+        printf("\n🚀 Generating text...\n");
         
-        // DELETE THESE HARDCODED LINES:
-        // int prompt[] = {2061, 318, 262, 362, 358, 1099, 286, 6268, 30};
-        
-        // REPLACE WITH THIS:
-        if (!train_dir) {
-            printf("\n🚀 Generating text...\n");
-            
-            if (prompt_length > 0) {
-                // Use provided prompt
-                generate(&M, prompt_tokens, prompt_length, 20);
-            } else {
-                // Default prompt if none provided
-                int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
-                printf("⚠️  No prompt provided, using default: \"Hello, I am\"\n");
-                generate(&M, default_prompt, 4, 20);
-            }
+        if (prompt_length > 0) {
+            generate(&M, prompt_tokens, prompt_length, 20);
+        } else {
+            int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
+            printf("⚠️  No prompt provided, using default: \"Hello, I am\"\n");
+            generate(&M, default_prompt, 4, 20);
         }
     }
 

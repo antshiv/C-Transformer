@@ -10,6 +10,7 @@ TRAIN_DIR=${TRAIN_DIR:-data/training_pairs}
 TRAIN_STEPS=${TRAIN_STEPS:-500}
 TRAIN_LR=${TRAIN_LR:-1e-4}
 TRAIN_LOG_INTERVAL=${TRAIN_LOG_INTERVAL:-10}
+WEIGHTS=${WEIGHTS:-gpt2_bump.weights}
 
 echo "======================"
 echo "1) Compile C-Transformer"
@@ -43,5 +44,13 @@ CMD=(./main
   --train-lr "${TRAIN_LR}"
   --train-log-interval "${TRAIN_LOG_INTERVAL}"
 )
+
+if [ -f "${WEIGHTS}" ]; then
+  echo "Found weights file '${WEIGHTS}', will fine-tune from it."
+  CMD+=(--weights "${WEIGHTS}")
+else
+  echo "Weights file '${WEIGHTS}' not found; training will start from random initialization."
+fi
+
 echo "Running: ${CMD[*]}"
 "${CMD[@]}"
