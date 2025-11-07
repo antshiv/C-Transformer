@@ -74,6 +74,7 @@
 #include <omp.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <dirent.h>
 
 #define ALIGN_UP(n, a) (((n) + (a) - 1) & ~((a) - 1))
 #define min(a, b) ((a) < (b) ? (a) : (b))
@@ -6002,12 +6003,191 @@ void compute_cross_entropy_loss(TransformerModel *M,
     *loss_out = total_loss / M->context_window;
 }
 
+typedef struct {
+    char **paths;
+    size_t count;
+} TrainingPairList;
+
+static void free_training_pair_list(TrainingPairList *list) {
+    if (!list || !list->paths) {
+        return;
+    }
+    for (size_t i = 0; i < list->count; ++i) {
+        free(list->paths[i]);
+    }
+    free(list->paths);
+    list->paths = NULL;
+    list->count = 0;
+}
+
+static int compare_path_strings(const void *a, const void *b) {
+    const char *const *pa = (const char *const *)a;
+    const char *const *pb = (const char *const *)b;
+    return strcmp(*pa, *pb);
+}
+
+static bool build_training_pair_list(const char *dir_path, TrainingPairList *out) {
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        fprintf(stderr, "❌ Failed to open training directory '%s': %s\n", dir_path, strerror(errno));
+        return false;
+    }
+    
+    size_t capacity = 0;
+    out->paths = NULL;
+    out->count = 0;
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        const char *ext = strrchr(entry->d_name, '.');
+        if (!ext || strcmp(ext, ".bin") != 0) {
+            continue;
+        }
+        
+        size_t dir_len = strlen(dir_path);
+        bool needs_sep = dir_len > 0 && dir_path[dir_len - 1] != '/';
+        size_t full_len = dir_len + (needs_sep ? 1 : 0) + strlen(entry->d_name) + 1;
+        
+        char *full_path = (char *)malloc(full_len);
+        if (!full_path) {
+            fprintf(stderr, "❌ Out of memory while listing training files\n");
+            closedir(dir);
+            free_training_pair_list(out);
+            return false;
+        }
+        snprintf(full_path, full_len, "%s%s%s", dir_path, needs_sep ? "/" : "", entry->d_name);
+        
+        if (out->count == capacity) {
+            size_t new_cap = capacity == 0 ? 64 : capacity * 2;
+            char **new_paths = realloc(out->paths, new_cap * sizeof(char *));
+            if (!new_paths) {
+                fprintf(stderr, "❌ Out of memory while storing training file list\n");
+                free(full_path);
+                closedir(dir);
+                free_training_pair_list(out);
+                return false;
+            }
+            out->paths = new_paths;
+            capacity = new_cap;
+        }
+        
+        out->paths[out->count++] = full_path;
+    }
+    
+    closedir(dir);
+    
+    if (out->count == 0) {
+        fprintf(stderr, "❌ No '.bin' training files found in %s\n", dir_path);
+        free_training_pair_list(out);
+        return false;
+    }
+    
+    qsort(out->paths, out->count, sizeof(char *), compare_path_strings);
+    return true;
+}
+
+static bool load_training_window(const char *file_path,
+                                 int context_len,
+                                 int32_t *input_tokens,
+                                 int32_t *target_tokens,
+                                 uint32_t *scratch) {
+    size_t total = (size_t)context_len + 1;
+    FILE *fp = fopen(file_path, "rb");
+    if (!fp) {
+        fprintf(stderr, "❌ Failed to open pair file '%s': %s\n", file_path, strerror(errno));
+        return false;
+    }
+    
+    size_t read = fread(scratch, sizeof(uint32_t), total, fp);
+    fclose(fp);
+    
+    if (read != total) {
+        fprintf(stderr, "❌ Expected %zu tokens in '%s' but read %zu\n", total, file_path, read);
+        return false;
+    }
+    
+    for (int i = 0; i < context_len; ++i) {
+        input_tokens[i] = (int32_t)scratch[i];
+        target_tokens[i] = (int32_t)scratch[i + 1];
+    }
+    return true;
+}
+
+float training_step(TransformerModel *M, 
+                    int32_t *input_tokens,
+                    int32_t *target_tokens,
+                    float learning_rate);
+
+static void run_training_loop(TransformerModel *M,
+                              const char *train_dir,
+                              int total_steps,
+                              float learning_rate,
+                              int log_interval) {
+    TrainingPairList list = {0};
+    if (!build_training_pair_list(train_dir, &list)) {
+        return;
+    }
+    
+    if (total_steps <= 0) {
+        total_steps = (int)list.count;
+    }
+    if (log_interval <= 0) {
+        log_interval = 10;
+    }
+    if (learning_rate <= 0.0f) {
+        learning_rate = 1e-4f;
+    }
+    
+    int32_t *input_tokens = (int32_t *)malloc((size_t)M->context_window * sizeof(int32_t));
+    int32_t *target_tokens = (int32_t *)malloc((size_t)M->context_window * sizeof(int32_t));
+    uint32_t *scratch = (uint32_t *)malloc(((size_t)M->context_window + 1) * sizeof(uint32_t));
+    
+    if (!input_tokens || !target_tokens || !scratch) {
+        fprintf(stderr, "❌ Failed to allocate buffers for training loop\n");
+        free(input_tokens);
+        free(target_tokens);
+        free(scratch);
+        free_training_pair_list(&list);
+        return;
+    }
+    
+    size_t pair_index = 0;
+    printf("\n🎯 Starting training loop (%d steps, lr=%.6f) using data at %s\n",
+           total_steps, learning_rate, train_dir);
+    
+    for (int step = 0; step < total_steps; ++step) {
+        const char *pair_path = list.paths[pair_index];
+        pair_index = (pair_index + 1) % list.count;
+        
+        if (!load_training_window(pair_path, M->context_window, input_tokens, target_tokens, scratch)) {
+            continue;
+        }
+        
+        float loss = training_step(M, input_tokens, target_tokens, learning_rate);
+        if ((step + 1) % log_interval == 0 || step == 0) {
+            float ppl = expf(loss);
+            printf("[train] step=%d/%d  loss=%.6f  perplexity=%.2f  sample=%s\n",
+                   step + 1, total_steps, loss, ppl, pair_path);
+        }
+    }
+    
+    printf("✅ Training complete.\n");
+    
+    free(input_tokens);
+    free(target_tokens);
+    free(scratch);
+    free_training_pair_list(&list);
+}
+
 void update_all_weights_sgd(TransformerModel *M, float learning_rate);
 
-void training_step(TransformerModel *M, 
-                   int32_t *input_tokens,
-                   int32_t *target_tokens,
-                   float learning_rate) {
+float training_step(TransformerModel *M, 
+                    int32_t *input_tokens,
+                    int32_t *target_tokens,
+                    float learning_rate) {
     
     // Store input tokens for backward pass
     memcpy(M->memory_base + M->gradients.actual_tokens_offset, 
@@ -6041,7 +6221,6 @@ void training_step(TransformerModel *M,
     
     float loss;
     compute_cross_entropy_loss(M, target_tokens, &loss);
-    printf("Step Loss: %.6f\n", loss);
     
     // Backward from logits (includes token embedding gradient via weight tying)
     backward_lm_head(M);
@@ -6059,6 +6238,8 @@ void training_step(TransformerModel *M,
 
     // ======== WEIGHT UPDATE ========
     update_all_weights_sgd(M, learning_rate);
+
+    return loss;
 }
 
 void update_all_weights_sgd(TransformerModel *M, float learning_rate) {
@@ -6178,6 +6359,10 @@ int main(int argc, char **argv)
     int run_benchmarks = 0;
     const char* weight_file = NULL;  // New option for weight file
     const char* prompt_str = NULL;  // For comma-separated tokens
+    const char* train_dir = NULL;   // Directory with packed training pairs
+    int train_steps = 0;
+    float train_learning_rate = 1e-4f;
+    int train_log_interval = 10;
     int prompt_tokens[1024];        // Store up to 1024 tokens
     int prompt_length = 0;          // Actual number of tokens
 
@@ -6190,7 +6375,11 @@ int main(int argc, char **argv)
         {"force", no_argument, 0, 'f'},
         {"benchmark", no_argument, 0, 'b'},
         {"weights", required_argument, 0, 'w'},  // New option for weight file
-	{"prompt", required_argument, 0, 'p'},
+        {"prompt", required_argument, 0, 'p'},
+        {"train-dir", required_argument, 0, 1000},
+        {"train-steps", required_argument, 0, 1001},
+        {"train-lr", required_argument, 0, 1002},
+        {"train-log-interval", required_argument, 0, 1003},
         {0, 0, 0, 0}
     };
 
@@ -6223,12 +6412,24 @@ int main(int argc, char **argv)
         case 'w':  // New case for weight file
             weight_file = optarg;
             break;
-	case 'p':  
+        case 'p':  
             prompt_str = optarg;
             break;
+        case 1000:
+            train_dir = optarg;
+            break;
+        case 1001:
+            train_steps = atoi(optarg);
+            break;
+        case 1002:
+            train_learning_rate = strtof(optarg, NULL);
+            break;
+        case 1003:
+            train_log_interval = atoi(optarg);
+            break;
         default:
-            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS]\n", argv[0]);
-	    return 1;
+            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N]\n", argv[0]);
+            return 1;
         }
     }
 
@@ -6253,6 +6454,10 @@ int main(int argc, char **argv)
     if (C % head_dim != 0) {
         fprintf(stderr, "❌ Error: embed_dim (%d) must be divisible by head_dim (%d)\n", C, head_dim);
         return 1;
+    }
+
+    if (train_dir) {
+        M.training_enabled = true;
     }
 
     size_t need_bytes = bytes_needed(M.num_layers, M.vocab_size, M.embed_dim, M.context_window);
@@ -6326,16 +6531,18 @@ int main(int argc, char **argv)
         // int prompt[] = {2061, 318, 262, 362, 358, 1099, 286, 6268, 30};
         
         // REPLACE WITH THIS:
-        printf("\n🚀 Generating text...\n");
-        
-        if (prompt_length > 0) {
-            // Use provided prompt
-            generate(&M, prompt_tokens, prompt_length, 20);
-        } else {
-            // Default prompt if none provided
-            int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
-            printf("⚠️  No prompt provided, using default: \"Hello, I am\"\n");
-            generate(&M, default_prompt, 4, 20);
+        if (!train_dir) {
+            printf("\n🚀 Generating text...\n");
+            
+            if (prompt_length > 0) {
+                // Use provided prompt
+                generate(&M, prompt_tokens, prompt_length, 20);
+            } else {
+                // Default prompt if none provided
+                int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
+                printf("⚠️  No prompt provided, using default: \"Hello, I am\"\n");
+                generate(&M, default_prompt, 4, 20);
+            }
         }
     }
 
@@ -6343,6 +6550,10 @@ int main(int argc, char **argv)
     {
         debug_math_comparison(&M);
         run_comprehensive_benchmark(&M);
+    }
+
+    if (train_dir) {
+        run_training_loop(&M, train_dir, train_steps, train_learning_rate, train_log_interval);
     }
 
     destroy_transformer(&M);
