@@ -5775,18 +5775,83 @@ void backward_attention_weighted_values(TransformerModel *M,
 }
 
 /**
- * BACKWARD THROUGH CAUSAL SOFTMAX
- * 
- * Forward: attention_weights[h,i,j] = softmax(scores[h,i,:]) with causal mask
- * 
- * Softmax Jacobian for row i:
- * ∂softmax[i,j]/∂score[i,k] = softmax[i,j] * (δ[j,k] - softmax[i,k])
- * where δ[j,k] is Kronecker delta (1 if j==k, 0 otherwise)
- * 
- * For a row, if y = softmax(x), then:
- * dx = y * (dy - dot(y, dy))
- * 
- * Causal mask means we only compute for j <= i
+ * @brief Computes the backward pass for the causal softmax function.
+ * @param M The transformer model.
+ * @param d_scores_offset Offset to the gradient of the attention weights (dL/dWeights), which is
+ *                        both the input and output of this function (dL/dScores).
+ * @param weights_copy_offset Offset to the cached attention weights (the output of the forward softmax).
+ *
+ * @details
+ * This function calculates the gradient of the loss with respect to the pre-softmax attention
+ * scores (`dL/dScores`) given the gradient with respect to the post-softmax attention
+ * weights (`dL/dWeights`). It does this for each row of the attention matrix independently,
+ * taking the causal mask into account.
+ *
+ * The operation is performed **in-place**, meaning the input `d_scores_offset` buffer is
+ * overwritten with the output gradients.
+ *
+ * @section math Mathematical Derivation: The Softmax Jacobian-Vector Product
+ *
+ * The core of this function is calculating the Jacobian-vector product for the softmax function.
+ * Let `y = softmax(x)`, where `x` is a vector of pre-softmax scores and `y` is the vector of
+ * resulting probabilities. The backward pass requires us to compute `dL/dx`, given `dL/dy`.
+ *
+ * By the chain rule: `dL/dx = (dL/dy) * (dy/dx)`.
+ * The term `dy/dx` is the Jacobian matrix `J` of the softmax function.
+ *
+ * The Jacobian `J` of softmax has a specific structure:
+ * `J[i, j] = y[i] * (kronecker_delta(i, j) - y[j])`
+ * where `kronecker_delta(i, j)` is 1 if `i == j` and 0 otherwise.
+ *
+ * This means:
+ * - On the diagonal (i=j): `J[i, i] = y[i] * (1 - y[i])`
+ * - Off the diagonal (i!=j): `J[i, j] = -y[i] * y[j]`
+ *
+ * A naive backward pass would be to form this `N x N` matrix `J` and multiply it by the
+ * `N x 1` vector `dL/dy`. This is computationally expensive (O(N^2)).
+ *
+ * **The Efficient Method (Jacobian-Vector Product):**
+ *
+ * We can compute the product `J @ (dL/dy)` without ever forming `J`. Let's expand the product
+ * for a single element `i` of the output `dL/dx`:
+ *
+ * `(dL/dx)[i] = sum_j ( J[i, j] * (dL/dy)[j] )`
+ * `           = sum_j ( y[i] * (delta(i, j) - y[j]) * (dL/dy)[j] )`
+ * `           = y[i] * sum_j ( (delta(i, j) - y[j]) * (dL/dy)[j] )`
+ * `           = y[i] * ( (delta(i, i) - y[i]) * (dL/dy)[i] + sum_{j!=i} (-y[j] * (dL/dy)[j]) )`
+ * `           = y[i] * ( (dL/dy)[i] - y[i]*(dL/dy)[i] - sum_{j!=i} (y[j] * (dL/dy)[j]) )`
+ *
+ * Notice that `y[i]*(dL/dy)[i] + sum_{j!=i} (y[j] * (dL/dy)[j])` is simply the dot product
+ * of the vector `y` and the vector `dL/dy`. Let's call this `dot(y, dL/dy)`.
+ *
+ * So, the equation simplifies to:
+ * `(dL/dx)[i] = y[i] * ( (dL/dy)[i] - dot(y, dL/dy) )`
+ *
+ * This is the formula implemented in the code. It's an O(N) operation, as it only requires
+ * one pass to compute the dot product and a second pass to apply the formula.
+ *
+ * In our code:
+ * - `x` are the pre-softmax scores (`scores`).
+ * - `y` are the post-softmax probabilities (`weights`).
+ * - `dL/dy` is the incoming gradient (`d_scores_inout`).
+ * - `dot(y, dL/dy)` is `dot_product`.
+ * - `(dL/dx)[i]` is the final value written back to `d_scores_inout`.
+ *
+ * @section implementation Implementation Details
+ *
+ * - **Parallelism**: The computation is parallelized across heads (`h`) and query tokens (`i`)
+ *   using `omp parallel for collapse(2)`. This is safe because each row `i` of the attention
+ *   matrix for each head `h` is processed independently.
+ * - **Causal Mask**: The loops for `j` run from `0` to `i`. This correctly applies the causal
+ *   mask, ensuring that the dot product and the final gradient calculation only include
+ *   terms from tokens that were attended to in the forward pass.
+ * - **In-Place Operation**: The code reads from `d_scores_inout` to calculate the `dot_product`,
+ *   then reads from it again inside the final loop while overwriting it with the new value.
+ *   This is safe because the `dot_product` is computed and stored in a local variable before
+ *   the overwrite loop begins.
+ *
+ * @see backward_attention_weighted_values Where the input gradient `dL/dWeights` comes from.
+ * @see backward_qk_matmul Where the output gradient `dL/dScores` is consumed.
  */
 void backward_causal_softmax(TransformerModel *M,
                             size_t d_scores_offset,        // [H×T×T] gradient in/out (reused)
@@ -5803,24 +5868,25 @@ void backward_causal_softmax(TransformerModel *M,
         for (int i = 0; i < T; i++) {
             // For each query position i, compute gradient for scores[h,i,:]
             
-            // First compute dot(softmax, d_softmax) for this row
+            // First compute dot(y, dL/dy) for this row, where y=weights and dL/dy=d_scores_inout
             float dot_product = 0.0f;
-            for (int j = 0; j <= i; j++) { // Causal: only j <= i
+            for (int j = 0; j <= i; j++) { // Causal mask: only j <= i contributes
                 float w = ATTN_ACCESS(weights, h, i, j, T);
-                float dw = ATTN_ACCESS(d_scores_inout, h, i, j, T);  // Read current gradient
+                float dw = ATTN_ACCESS(d_scores_inout, h, i, j, T);  // Read current gradient (dL/dy)
                 dot_product += w * dw;
             }
             
-            // Apply the softmax backward formula: dx = y * (dy - dot(y, dy))
-            // NOTE: We're overwriting d_scores in place
-            for (int j = 0; j <= i; j++) { // Causal: only j <= i
+            // Apply the softmax backward formula: dL/dx = y * (dL/dy - dot(y, dL/dy))
+            // NOTE: We're overwriting d_scores_inout in place.
+            for (int j = 0; j <= i; j++) { // Causal mask
                 float w = ATTN_ACCESS(weights, h, i, j, T);
-                float dw = ATTN_ACCESS(d_scores_inout, h, i, j, T);  // Read before overwrite
+                float dw = ATTN_ACCESS(d_scores_inout, h, i, j, T);  // Read dL/dy before overwrite
                 
-                ATTN_ACCESS(d_scores_inout, h, i, j, T) = w * (dw - dot_product);  // Overwrite
+                // Calculate dL/dx and overwrite the buffer
+                ATTN_ACCESS(d_scores_inout, h, i, j, T) = w * (dw - dot_product);
             }
             
-            // Zero out the upper triangle (j > i) due to causal mask
+            // Zero out the upper triangle (j > i) as their gradient contribution is zero
             for (int j = i + 1; j < T; j++) {
                 ATTN_ACCESS(d_scores_inout, h, i, j, T) = 0.0f;
             }
@@ -6068,6 +6134,95 @@ void backward_lm_head(TransformerModel *M) {
 
 
 
+/**
+ * @brief Performs the backward pass for a single transformer layer.
+ * @param M The transformer model.
+ * @param layer_idx The index of the layer to process.
+ *
+ * @details
+ * This function orchestrates the backpropagation of gradients through one entire
+ * transformer layer, from its output back to its input. It follows the chain rule
+ * in reverse order of the forward pass operations.
+ *
+ * @section gradient_flow End-to-End Gradient Flow
+ *
+ * The gradient flows from the output of the layer (`d_layer_output`) back to its
+ * input (`d_ln1_input`), accumulating gradients for all weights and biases along the way.
+ *
+ * @verbatim
+ *
+ *                                d_layer_output (from layer L+1 or final LN)
+ *                                      │
+ *                                      ▼
+ *      [ 8. Backward through 2nd Residual Connection (d_residual2) ]
+ *         /                                       \
+ *        ▼                                         ▼
+ *  d_residual1 (accumulated)                  d_mlp_output
+ *        │                                         │
+ *        │                                         ▼
+ *        │                             [ 7. Backward through MLP Block ]
+ *        │                                (FC2 -> GELU -> FC1)
+ *        │                                         │
+ *        │                                         ▼
+ *        │                                    d_ln2_output
+ *        │                                         │
+ *        │                                         ▼
+ *        │                           [ 6. Backward through 2nd LayerNorm ]
+ *        │                                         │
+ *        │                                         ▼
+ *        └──────────────────────────────────> d_ln2_input (accumulated to d_residual1)
+ *                                                  │
+ *                                                  ▼
+ *      [ 5. Backward through 1st Residual Connection (d_residual1) ]
+ *         /                                       \
+ *        ▼                                         ▼
+ *  d_ln1_input (to layer L-1)               d_attention_output
+ *                                                  │
+ *                                                  ▼
+ *                               [ 4. Backward through Attention Projection ]
+ *                                                  │
+ *                                                  ▼
+ *                                        d_attention_heads
+ *                                                  │
+ *                                                  ▼
+ *                               [ 3. Backward through Attention Mechanism ]
+ *                               (Scores*V -> Softmax -> QK^T)
+ *                                    /         |           \
+ *                                   ▼          ▼            ▼
+ *                                 d_Q        d_K          d_V
+ *                                   │          │            │
+ *                                   ▼          ▼            ▼
+ *                         [ 2. Backward through Q, K, V Projections ]
+ *                                   (Gradients accumulate into d_ln1_output)
+ *                                                  │
+ *                                                  ▼
+ *                            [ 1. Backward through 1st LayerNorm ]
+ *                                                  │
+ *                                                  ▼
+ *                                        d_ln1_input (Final output gradient for this layer)
+ *
+ * @endverbatim
+ *
+ * **Key Steps:**
+ * 1.  **Residual Connections**: The `backward_residual_connection` function splits the incoming
+ *     gradient, sending it down both the skip-connection path and the transformation path.
+ *     The gradient from the skip path is added to the gradient from the transformation's input.
+ * 2.  **MLP & Attention Blocks**: Each block (MLP, Attention) takes an incoming gradient and
+ *     computes gradients for its own weights/biases and for its input.
+ * 3.  **LayerNorm**: The `backward_layernorm` function computes gradients for gamma/beta and for
+ *     the LayerNorm's input.
+ * 4.  **QKV Projections**: The `backward_linear` function is used for each of the Q, K, and V
+ *     projections. A crucial detail is that the gradients for their inputs (`d_ln1_output`) are
+ *     **accumulated**, because all three projections originated from the same source tensor
+ *     in the forward pass.
+ * 5.  **Final Output**: The final gradient `d_ln1_input` becomes the input gradient for the
+ *     preceding layer (`layer_idx - 1`), continuing the chain rule.
+ *
+ * @see backward_residual_connection
+ * @see backward_mlp (conceptual, composed of backward_fc2, backward_gelu, backward_fc1)
+ * @see backward_attention_mechanism (conceptual, composed of multiple functions)
+ * @see backward_layernorm
+ */
 void backward_transformer_layer(TransformerModel *M, int layer_idx) {
     LayerGradients *LG = &M->gradients.layers[layer_idx];
     TrulyOptimalLayer *L = &M->layers[layer_idx];
