@@ -11,6 +11,8 @@ TRAIN_STEPS=${TRAIN_STEPS:-500}
 TRAIN_LR=${TRAIN_LR:-1e-4}
 TRAIN_LOG_INTERVAL=${TRAIN_LOG_INTERVAL:-10}
 WEIGHTS=${WEIGHTS:-gpt2_bump.weights}
+CHECKPOINT_DIR=${CHECKPOINT_DIR:-checkpoints}
+CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-50}
 
 echo "======================"
 echo "1) Compile C-Transformer"
@@ -43,6 +45,8 @@ CMD=(./main
   --train-steps "${TRAIN_STEPS}"
   --train-lr "${TRAIN_LR}"
   --train-log-interval "${TRAIN_LOG_INTERVAL}"
+  --ckpt-dir "${CHECKPOINT_DIR}"
+  --ckpt-interval "${CHECKPOINT_INTERVAL}"
 )
 
 if [ -f "${WEIGHTS}" ]; then

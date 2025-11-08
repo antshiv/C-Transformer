@@ -75,6 +75,9 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <limits.h>
 
 #define ALIGN_UP(n, a) (((n) + (a) - 1) & ~((a) - 1))
 #define min(a, b) ((a) < (b) ? (a) : (b))
@@ -884,6 +887,14 @@ void layout_transformer(TransformerModel *M, bool training_mode) {
 }
 
 /* ─── destruction helper ─────────────────────────────────────────── */
+static void ensure_model_header_defaults(TransformerModel *M) {
+    memcpy(M->magic, "BUMPWGT2", 8);
+    M->version = 2;
+    M->model_type = 0;
+    memset(M->checksum, 0, sizeof(M->checksum));
+    memset(M->reserved, 0, sizeof(M->reserved));
+}
+
 void destroy_transformer(TransformerModel *M)
 {
     munmap(M->memory_base, align_up(M->total_floats * sizeof(float), HUGE_ALIGN));
@@ -1006,6 +1017,26 @@ static bool verify_canaries(TransformerModel *M, const char *stage) {
     }
     
     return ok;
+}
+
+static bool ensure_directory_exists(const char *path) {
+    if (!path) return false;
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return true;
+        }
+        fprintf(stderr, "❌ Checkpoint path %s exists but is not a directory.\n", path);
+        return false;
+    }
+    if (mkdir(path, 0755) == 0) {
+        return true;
+    }
+    if (errno == EEXIST) {
+        return true;
+    }
+    fprintf(stderr, "❌ Failed to create checkpoint directory %s: %s\n", path, strerror(errno));
+    return false;
 }
 
 // Calculate memory requirements
@@ -4276,6 +4307,113 @@ void run_comprehensive_benchmark(TransformerModel *M)
  * @param weight_file Path to the .weights file
  * @return 0 on success, -1 on failure
  */
+int save_model_weights(TransformerModel *M, const char* weight_file) {
+    if (M->memory_base == NULL) {
+        fprintf(stderr, "❌ Model memory not allocated. Cannot save weights.\n");
+        return -1;
+    }
+    
+    FILE *fp = fopen(weight_file, "wb");
+    if (!fp) {
+        fprintf(stderr, "❌ Could not open checkpoint for writing: %s\n", weight_file);
+        return -1;
+    }
+    
+    // Ensure header defaults exist (useful for randomly initialized runs)
+    if (memcmp(M->magic, "BUMPWGT2", 8) != 0) {
+        ensure_model_header_defaults(M);
+    }
+    
+    uint32_t version = M->version ? M->version : 2;
+    uint32_t model_type = M->model_type;
+    
+    fwrite(M->magic, 1, 8, fp);
+    fwrite(&version, sizeof(uint32_t), 1, fp);
+    fwrite(&model_type, sizeof(uint32_t), 1, fp);
+    
+    uint32_t hyper[6] = {
+        (uint32_t)M->num_layers,
+        (uint32_t)M->vocab_size,
+        (uint32_t)M->embed_dim,
+        (uint32_t)M->context_window,
+        (uint32_t)M->num_attention_heads,
+        (uint32_t)M->head_dim
+    };
+    fwrite(hyper, sizeof(uint32_t), 6, fp);
+    
+    uint64_t aligned_vals[3] = {
+        (uint64_t)M->aligned_embed_dim,
+        (uint64_t)M->aligned_head_dim,
+        (uint64_t)M->aligned_attn_context_window
+    };
+    fwrite(aligned_vals, sizeof(uint64_t), 3, fp);
+    
+    fwrite(M->checksum, 1, 32, fp);
+    fwrite(M->reserved, 1, 32, fp);
+    
+    #define WRITE_ALIGNED_TENSOR(ptr, count, name) do { \
+        size_t bytes = (count) * sizeof(float); \
+        if (fwrite(ptr, 1, bytes, fp) != bytes) { \
+            fprintf(stderr, "❌ Failed to write %s to checkpoint\n", name); \
+            fclose(fp); \
+            return -1; \
+        } \
+    } while (0)
+    
+    WRITE_ALIGNED_TENSOR(M->memory_base + M->token_emb_offset,
+                         (size_t)M->vocab_size * M->aligned_embed_dim,
+                         "token_embeddings");
+    
+    WRITE_ALIGNED_TENSOR(M->memory_base + M->pos_emb_offset,
+                         (size_t)M->context_window * M->aligned_embed_dim,
+                         "position_embeddings");
+    
+    for (int layer = 0; layer < M->num_layers; layer++) {
+        TrulyOptimalLayer *L = &M->layers[layer];
+        
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->ln1_weight_offset, M->aligned_embed_dim, "ln1_weight");
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->ln1_bias_offset, M->aligned_embed_dim, "ln1_bias");
+        
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->q_weight_offset,
+                             (size_t)M->aligned_embed_dim * M->aligned_embed_dim, "q_weight");
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->q_bias_offset, M->aligned_embed_dim, "q_bias");
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->k_weight_offset,
+                             (size_t)M->aligned_embed_dim * M->aligned_embed_dim, "k_weight");
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->k_bias_offset, M->aligned_embed_dim, "k_bias");
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->v_weight_offset,
+                             (size_t)M->aligned_embed_dim * M->aligned_embed_dim, "v_weight");
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->v_bias_offset, M->aligned_embed_dim, "v_bias");
+        
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->proj_weight_offset,
+                             (size_t)M->aligned_embed_dim * M->aligned_embed_dim, "proj_weight");
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->proj_bias_offset, M->aligned_embed_dim, "proj_bias");
+        
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->ln2_weight_offset, M->aligned_embed_dim, "ln2_weight");
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->ln2_bias_offset, M->aligned_embed_dim, "ln2_bias");
+        
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->fc1_weight_offset,
+                             (size_t)4 * M->aligned_embed_dim * M->aligned_embed_dim, "fc1_weight");
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->fc1_bias_offset,
+                             (size_t)4 * M->aligned_embed_dim, "fc1_bias");
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->fc2_weight_offset,
+                             (size_t)4 * M->aligned_embed_dim * M->aligned_embed_dim, "fc2_weight");
+        WRITE_ALIGNED_TENSOR(M->memory_base + L->fc2_bias_offset,
+                             M->aligned_embed_dim, "fc2_bias");
+    }
+    
+    WRITE_ALIGNED_TENSOR(M->memory_base + M->final_ln_weight_offset,
+                         M->aligned_embed_dim, "final_ln_weight");
+    WRITE_ALIGNED_TENSOR(M->memory_base + M->final_ln_bias_offset,
+                         M->aligned_embed_dim, "final_ln_bias");
+    
+    #undef WRITE_ALIGNED_TENSOR
+    
+    fflush(fp);
+    fclose(fp);
+    printf("💾 Saved checkpoint to %s\n", weight_file);
+    return 0;
+}
+
 int load_model_weights(TransformerModel *M, const char* weight_file) {
     if (M->memory_base == NULL) {
         fprintf(stderr, "❌ Model memory not allocated. Call layout_transformer() first.\n");
@@ -6242,7 +6380,9 @@ static void run_training_loop(TransformerModel *M,
                               const char *train_dir,
                               int total_steps,
                               float learning_rate,
-                              int log_interval) {
+                              int log_interval,
+                              const char *checkpoint_dir,
+                              int checkpoint_interval) {
     TrainingPairList list = {0};
     if (!build_training_pair_list(train_dir, &list)) {
         return;
@@ -6266,6 +6406,14 @@ static void run_training_loop(TransformerModel *M,
     uint32_t *pair_tokens_u32 = (uint32_t *)(M->memory_base + M->gradients.training_pair_tokens_offset);
     int32_t *input_tokens = (int32_t *)pair_tokens_u32;
     int32_t *target_tokens = input_tokens + 1;
+    
+    bool checkpoints_enabled = (checkpoint_dir && checkpoint_dir[0] != '\0');
+    if (checkpoints_enabled && !ensure_directory_exists(checkpoint_dir)) {
+        checkpoints_enabled = false;
+    }
+    if (checkpoints_enabled && checkpoint_interval <= 0) {
+        checkpoint_interval = 50;
+    }
     
     size_t pair_index = 0;
     printf("\n🎯 Starting training loop (%d steps, lr=%.6f) using data at %s\n",
@@ -6297,9 +6445,27 @@ static void run_training_loop(TransformerModel *M,
             printf("[train] step=%d/%d  loss=%.6f  perplexity=%.2f  sample=%s\n",
                    step + 1, total_steps, loss, ppl, pair_path);
         }
+        
+        if (checkpoints_enabled && checkpoint_interval > 0 &&
+            ((step + 1) % checkpoint_interval == 0)) {
+            char ckpt_path[PATH_MAX];
+            snprintf(ckpt_path, sizeof(ckpt_path), "%s/ckpt_step_%06d.weights",
+                     checkpoint_dir, step + 1);
+            if (save_model_weights(M, ckpt_path) != 0) {
+                fprintf(stderr, "⚠️  Failed to save checkpoint at step %d\n", step + 1);
+            }
+        }
     }
     
     printf("✅ Training complete.\n");
+    
+    if (checkpoints_enabled) {
+        char final_path[PATH_MAX];
+        snprintf(final_path, sizeof(final_path), "%s/ckpt_final.weights", checkpoint_dir);
+        if (save_model_weights(M, final_path) != 0) {
+            fprintf(stderr, "⚠️  Failed to save final checkpoint\n");
+        }
+    }
     
     free_training_pair_list(&list);
 }
@@ -6485,6 +6651,8 @@ int main(int argc, char **argv)
     int train_steps = 0;
     float train_learning_rate = 1e-4f;
     int train_log_interval = 10;
+    const char* checkpoint_dir = NULL;
+    int checkpoint_interval = 0;
     int prompt_tokens[1024];        // Store up to 1024 tokens
     int prompt_length = 0;          // Actual number of tokens
 
@@ -6502,6 +6670,8 @@ int main(int argc, char **argv)
         {"train-steps", required_argument, 0, 1001},
         {"train-lr", required_argument, 0, 1002},
         {"train-log-interval", required_argument, 0, 1003},
+        {"ckpt-dir", required_argument, 0, 1004},
+        {"ckpt-interval", required_argument, 0, 1005},
         {0, 0, 0, 0}
     };
 
@@ -6549,8 +6719,14 @@ int main(int argc, char **argv)
         case 1003:
             train_log_interval = atoi(optarg);
             break;
+        case 1004:
+            checkpoint_dir = optarg;
+            break;
+        case 1005:
+            checkpoint_interval = atoi(optarg);
+            break;
         default:
-            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N]\n", argv[0]);
             return 1;
         }
     }
@@ -6580,6 +6756,10 @@ int main(int argc, char **argv)
 
     if (train_dir) {
         M.training_enabled = true;
+    }
+    
+    if (!weight_file) {
+        ensure_model_header_defaults(&M);
     }
 
     size_t need_bytes = bytes_needed(M.num_layers, M.vocab_size, M.embed_dim, M.context_window);
@@ -6695,7 +6875,8 @@ int main(int argc, char **argv)
     }
 
     if (train_dir) {
-        run_training_loop(&M, train_dir, train_steps, train_learning_rate, train_log_interval);
+        run_training_loop(&M, train_dir, train_steps, train_learning_rate, train_log_interval,
+                          checkpoint_dir, checkpoint_interval);
     }
 
     destroy_transformer(&M);
