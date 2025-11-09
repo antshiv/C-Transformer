@@ -2,12 +2,12 @@
 
 ## Executive Summary
 
-**Your C-Transformer and Google's gemma.cpp share the same fundamental philosophy**: CPU-first transformers with contiguous memory, cache-aware design, and vertical integration. However, they diverge in **portability strategy** and **target use case**.
+**C-Transformer and Google's gemma.cpp share the same fundamental philosophy**: CPU-first transformers with contiguous memory, cache-aware design, and vertical integration. However, they diverge in **portability strategy** and **target use case**.
 
 - **C-Transformer**: Low-level x86-specific optimization, training-focused, massive memory leverage
 - **gemma.cpp**: Portable SIMD via Highway library, inference-focused, research experimentation
 
-**Key insight**: You're doing essentially the same optimizations as Google, just with different tooling choices.
+**Key insight**: C-Transformer implements essentially the same optimizations as Google, just with different tooling choices.
 
 ---
 
@@ -35,7 +35,7 @@
 | **Portability** | x86-only, requires rewrite for ARM | Write once, runs on all ISAs |
 | **Manual tuning** | Hand-written kernels (GEMM, softmax, etc.) | Highway + BF16 GEMM autotuning |
 
-**Example from your code** (direct AVX-512):
+**Example from C-Transformer** (direct AVX-512):
 ```c
 __m512 a_vec = _mm512_loadu_ps(&A[i * K + k]);
 __m512 b_vec = _mm512_loadu_ps(&B[j * K + k]);
@@ -50,7 +50,7 @@ auto b_vec = LoadU(d, &B[j * K + k]);
 sum_vec = MulAdd(a_vec, b_vec, sum_vec);
 ```
 
-**Verdict**: You write lower-level code for maximum x86 performance. They use Highway for "write once, run anywhere" portability.
+**Verdict**: C-Transformer uses lower-level code for maximum x86 performance. gemma.cpp uses Highway for "write once, run anywhere" portability.
 
 ---
 
@@ -65,7 +65,7 @@ sum_vec = MulAdd(a_vec, b_vec, sum_vec);
 | **Parallelism levels** | Token-parallel + head-parallel | Similar multi-level strategy |
 | **Batch size** | Fixed batch=1 (real-time inference) | Research-focused (likely similar) |
 
-**Your approach**:
+**C-Transformer approach**:
 ```c
 M.num_cores = logical_cores - 4;  // Reserve 4 for OS
 M.tokens_per_core = (context_window + num_cores - 1) / num_cores;
@@ -81,7 +81,7 @@ for (int t = 0; t < M->context_window; t++) {
 - Automatically maps threads to physical topology
 - Handles multi-socket systems intelligently
 
-**Verdict**: Both are NUMA-aware and cache-conscious. gemma.cpp has more sophisticated thread pool management; you rely on OpenMP's runtime scheduler.
+**Verdict**: Both are NUMA-aware and cache-conscious. gemma.cpp has more sophisticated thread pool management; C-Transformer relies on OpenMP's runtime scheduler.
 
 ---
 
@@ -97,7 +97,7 @@ for (int t = 0; t < M->context_window; t++) {
 | **Quantization** | Not implemented | Integrated into GEMM (on-the-fly decompression) |
 | **Transpose handling** | Manual transposes in memory layout | Similar (weights stored transposed) |
 
-**Your GEMM** (main.c:1142):
+**C-Transformer GEMM** (main.c:1142):
 ```c
 // Cache-blocked matrix multiplication with AVX-512
 void gemm_avx512_parallel(float *A, float *B, float *C, int M, int N, int K) {
@@ -116,7 +116,7 @@ void gemm_avx512_parallel(float *A, float *B, float *C, int M, int N, int K) {
 - Autotuned for each matrix shape at runtime
 - Integrates weight decompression directly into multiplication
 
-**Verdict**: Your GEMM is simpler (FP32-only), but that's appropriate for training. gemma.cpp focuses on inference efficiency with quantization.
+**Verdict**: C-Transformer's GEMM is simpler (FP32-only), but that's appropriate for training. gemma.cpp focuses on inference efficiency with quantization.
 
 ### Attention Mechanism
 
@@ -146,7 +146,7 @@ void gemm_avx512_parallel(float *A, float *B, float *C, int M, int N, int K) {
 
 ### The "Massive Memory" Strategy
 
-**Your unique advantage**:
+**C-Transformer's unique advantage**:
 ```
 CPU: 12-channel DDR5 → 12 × 64 GB = 768 GB DRAM possible
 GPU: Limited to 80-192 GB HBM (even H100)
@@ -165,30 +165,30 @@ Goal: Load models so large they can't fit on GPUs
 - Inference-only (no gradient storage needed)
 - Uses quantization (FP8, 4-bit NUQ) to reduce footprint
 
-**Your approach is more ambitious**: Leverage CPU's memory advantage for training models that exceed GPU capacity.
+**C-Transformer's approach is more ambitious**: Leverage CPU's memory advantage for training models that exceed GPU capacity.
 
 ---
 
-## 5. How Your Optimizations Compare to Google
+## 5. How C-Transformer Optimizations Compare to Google
 
-### What You're Doing Right (Same as Google)
+### What C-Transformer Implements Correctly (Same as Google)
 
 ✅ **Contiguous memory layout** - Identical approach
 ✅ **Cache-aware blocking** - Both do this
-✅ **SIMD vectorization** - You use AVX-512, they use Highway (same ISA underneath)
+✅ **SIMD vectorization** - C-Transformer uses AVX-512, gemma.cpp uses Highway (same ISA underneath)
 ✅ **Token-parallel computation** - Both leverage this
 ✅ **NUMA awareness** - Both handle multi-socket systems
-✅ **Hugepage backing** - You explicit, they implicit via mmap
+✅ **Hugepage backing** - C-Transformer explicit, gemma.cpp implicit via mmap
 ✅ **Vertical integration** - Both avoid external frameworks
 
-### What They Do Better
+### gemma.cpp Advantages
 
 🔸 **Portability**: Highway enables ARM/RISC-V without code rewrite
 🔸 **Quantization**: FP8, BF16, 4-bit NUQ integrated into GEMM
 🔸 **Autotuning**: Runtime parameter optimization per matrix shape
 🔸 **Weight compression**: Custom formats with on-the-fly decompression
 
-### What You Do Better
+### C-Transformer Advantages
 
 🔸 **Training support**: Full backprop + gradient storage + optimizer
 🔸 **Massive memory leverage**: Designed for models that exceed GPU capacity
@@ -201,7 +201,7 @@ Goal: Load models so large they can't fit on GPUs
 
 ### Current x86-Specific Code
 
-Your AVX-512-specific code locations:
+C-Transformer's AVX-512-specific code locations:
 
 1. **GEMM kernel** (main.c:1142-1300)
    - `_mm512_loadu_ps()` → ARM NEON: `vld1q_f32()`
@@ -220,7 +220,7 @@ Your AVX-512-specific code locations:
 **Approach 1: Manual ARM NEON Port** (~95% of code unchanged)
 ```c
 #ifdef __AVX512F__
-    // Your existing AVX-512 code
+    // C-Transformer's existing AVX-512 code
     __m512 a = _mm512_loadu_ps(ptr);
 #elif defined(__ARM_NEON)
     // ARM NEON equivalent
@@ -240,7 +240,7 @@ Your AVX-512-specific code locations:
 
 Replace:
 ```c
-// Your current code
+// Current C-Transformer code
 __m512 a_vec = _mm512_loadu_ps(&A[i]);
 __m512 b_vec = _mm512_loadu_ps(&B[i]);
 sum_vec = _mm512_fmadd_ps(a_vec, b_vec, sum_vec);
@@ -258,7 +258,7 @@ sum_vec = MulAdd(a_vec, b_vec, sum_vec);
 **Tradeoff**:
 - ✅ Portable to ARM, RISC-V, PPC, WASM automatically
 - ✅ Maintained by Google (bug fixes, new ISAs)
-- ❌ Requires C++ (your code is pure C)
+- ❌ Requires C++ (C-Transformer is pure C)
 - ❌ Abstraction layer may hinder low-level optimization
 - ❌ Dependency on external library
 
@@ -279,23 +279,23 @@ sum_vec = MulAdd(a_vec, b_vec, sum_vec);
 - NEON support (128-bit)
 - AMX (Apple Matrix Accelerator) for matrix ops
 - Up to 192 GB unified memory (M2 Ultra)
-- **Perfect fit for your "massive memory" strategy**
+- **Perfect fit for C-Transformer's "massive memory" strategy**
 
 **AWS Graviton3/4**:
 - ARM Neoverse cores with SVE
 - Up to 1 TB DDR5 memory per socket
-- **Also perfect for massive memory approach**
+- **Also perfect for C-Transformer's massive memory approach**
 
 ---
 
 ## 7. Strategic Recommendations
 
-### Short-Term: Keep Your Current Approach
+### Short-Term: Maintain Current Approach
 
 **Reasons**:
-1. Your x86 optimization work is solid - on par with Google
+1. C-Transformer's x86 optimization work is solid - on par with Google
 2. Pure C code is more educational than Highway abstractions
-3. Training focus differentiates you from gemma.cpp
+3. Training focus differentiates C-Transformer from gemma.cpp
 4. Massive memory strategy is unique and valuable
 
 ### Medium-Term: Consider Hybrid Strategy
@@ -313,16 +313,16 @@ sum_vec = MulAdd(a_vec, b_vec, sum_vec);
 - **Pros**: Portability with minimal changes
 - **Cons**: Mixed C/C++ codebase
 
-### Long-Term: Emphasize Your Unique Advantages
+### Long-Term: Emphasize C-Transformer's Unique Advantages
 
-**Your differentiators vs gemma.cpp**:
+**C-Transformer's differentiators vs gemma.cpp**:
 
-1. **Training support** - They don't emphasize this; you do
+1. **Training support** - gemma.cpp doesn't emphasize this; C-Transformer does
 2. **Massive memory leverage** - Show 175B+ models trained on CPU
 3. **Educational value** - Direct SIMD code is better for learning
-4. **Conservation AI focus** - Your Antsand platform integration
+4. **Conservation AI focus** - Antsand platform integration
 
-**Marketing angle**:
+**Positioning**:
 > "gemma.cpp proves Google agrees CPU transformers are viable. C-Transformer takes it further: training models too large for GPUs by leveraging commodity DRAM's capacity advantage."
 
 ---
@@ -331,22 +331,22 @@ sum_vec = MulAdd(a_vec, b_vec, sum_vec);
 
 ### Suggested Comparison Tests
 
-**If you want to benchmark directly**:
+**To benchmark directly**:
 
-1. **Load Gemma-2B model into your framework**
-   - Convert weights to your format
+1. **Load Gemma-2B model into C-Transformer**
+   - Convert weights to C-Transformer's format
    - Run inference-only mode
    - Compare tokens/sec vs gemma.cpp
 
 2. **Compare memory efficiency**
-   - Your FP32: 4 bytes/parameter
-   - Their BF16: 2 bytes/parameter
-   - Their FP8: 1 byte/parameter
-   - **But**: You support training (they don't emphasize this)
+   - C-Transformer FP32: 4 bytes/parameter
+   - gemma.cpp BF16: 2 bytes/parameter
+   - gemma.cpp FP8: 1 byte/parameter
+   - **However**: C-Transformer supports training (gemma.cpp doesn't emphasize this)
 
 3. **FLOPS comparison**
    - Measure GFLOPS for GEMM kernels
-   - Your AVX-512 vs their Highway+BF16
+   - C-Transformer AVX-512 vs gemma.cpp Highway+BF16
    - Likely similar on x86 (both use same ISA)
 
 4. **Scaling test**
@@ -358,16 +358,16 @@ sum_vec = MulAdd(a_vec, b_vec, sum_vec);
 
 ## 9. Conclusion
 
-### You're Playing in the Same League as Google
+### C-Transformer Competes with Google
 
-**Key takeaway**: Your optimization approach is fundamentally sound and mirrors what Google does in gemma.cpp. The main differences are:
+**Key takeaway**: C-Transformer's optimization approach is fundamentally sound and mirrors what Google does in gemma.cpp. The main differences are:
 
-1. **Tooling**: You use direct intrinsics; they use Highway abstraction
-2. **Focus**: You target training; they target inference
-3. **Memory strategy**: You leverage massive DRAM; they focus on compression
-4. **Portability**: They prioritize cross-platform; you optimize for x86
+1. **Tooling**: C-Transformer uses direct intrinsics; gemma.cpp uses Highway abstraction
+2. **Focus**: C-Transformer targets training; gemma.cpp targets inference
+3. **Memory strategy**: C-Transformer leverages massive DRAM; gemma.cpp focuses on compression
+4. **Portability**: gemma.cpp prioritizes cross-platform; C-Transformer optimizes for x86
 
-**You're not behind Google - you're optimizing different dimensions.**
+**C-Transformer is not behind Google - it optimizes different dimensions.**
 
 ### The ARM Question
 
@@ -375,9 +375,9 @@ sum_vec = MulAdd(a_vec, b_vec, sum_vec);
 **Approach**: Start with manual NEON port of GEMM kernel, then expand
 **Payoff**: Access to Apple Silicon (192 GB unified memory) and AWS Graviton (1 TB DRAM)
 
-**Critical insight**: Your "massive memory" strategy actually works BETTER on ARM servers (Graviton) than x86, because ARM CPUs can have more memory channels.
+**Critical insight**: C-Transformer's "massive memory" strategy actually works BETTER on ARM servers (Graviton) than x86, because ARM CPUs can have more memory channels.
 
-### Your Unique Position
+### C-Transformer's Unique Position
 
 **What gemma.cpp doesn't do**:
 - Full training with backprop
@@ -385,9 +385,9 @@ sum_vec = MulAdd(a_vec, b_vec, sum_vec);
 - Educational transparency (Highway abstractions hide ISA details)
 - Conservation robotics integration (Antsand platform)
 
-**Your niche**: Training large models on CPU by leveraging memory capacity advantage.
+**C-Transformer's niche**: Training large models on CPU by leveraging memory capacity advantage.
 
-This is a valid, important niche that Google isn't addressing. Keep going.
+This is a valid, important niche that Google isn't addressing.
 
 ---
 

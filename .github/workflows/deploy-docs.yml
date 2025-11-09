@@ -1,0 +1,75 @@
+# Deploy Doxygen Documentation to GitHub Pages
+name: Deploy Documentation
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'main.c'
+      - 'docs/**'
+      - 'Doxyfile'
+      - '.github/workflows/deploy-docs.yml'
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-docs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Doxygen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y doxygen graphviz
+
+      - name: Generate Doxygen documentation
+        run: |
+          doxygen Doxyfile
+          echo "Documentation generated in docs/html/"
+          ls -lh docs/html/ | head -20
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './docs/html'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  # Optional: Check documentation quality
+  check-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check markdown files exist
+        run: |
+          echo "Checking documentation files..."
+          test -f docs/NUMERICAL_METHODS.md && echo "✓ NUMERICAL_METHODS.md"
+          test -f docs/USAGE_GUIDE.md && echo "✓ USAGE_GUIDE.md"
+          test -f docs/BACKPROP_FLOW.md && echo "✓ BACKPROP_FLOW.md"
+          test -f docs/COMPARISON_WITH_GEMMA_CPP.md && echo "✓ COMPARISON_WITH_GEMMA_CPP.md"
+          test -f docs/README.md && echo "✓ README.md"
+          test -f Doxyfile && echo "✓ Doxyfile"
+
+      - name: Check Doxyfile configuration
+        run: |
+          echo "Checking Doxygen config..."
+          grep -q "OUTPUT_DIRECTORY.*docs" Doxyfile && echo "✓ Output directory correct"
+          grep -q "USE_MDFILE_AS_MAINPAGE.*README" Doxyfile && echo "✓ Main page configured"
