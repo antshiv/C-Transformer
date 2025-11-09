@@ -1,1 +1,12 @@
-docs/
+# Ignore generated documentation (HTML, LaTeX, etc.)
+# But keep the source markdown files and Doxyfile
+docs/html/
+docs/latex/
+docs/doxygen/
+docs/man/
+docs/rtf/
+docs/xml/
+
+# Keep these files (they're source, not generated):
+# docs/*.md
+# Doxyfile
