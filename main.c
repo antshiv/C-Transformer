@@ -4971,23 +4971,36 @@ void backward_embedding_layer(TransformerModel *M) {
     float *d_embedded = M->memory_base + L0_grad->d_ln1_input_offset;
     float *d_token_emb = M->memory_base + M->gradients.d_embed_weights_offset;
     float *d_pos_emb = M->memory_base + M->gradients.d_pos_embed_offset;
+    int aligned_dim = M->aligned_embed_dim;
+    int embed_dim = M->embed_dim;
+    int T = M->context_window;
     
     // Get stored token IDs
     int32_t *token_ids = (int32_t*)(M->memory_base + M->gradients.actual_tokens_offset);
     
-    #pragma omp parallel for num_threads(M->num_cores)
-    for (int t = 0; t < M->context_window; t++) {
-        int token_id = token_ids[t];
+    const int vec = 16;
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(M->num_cores)
+    for (int d = 0; d < aligned_dim; d += vec) {
+        int remaining = aligned_dim - d;
+        __mmask16 lane_mask = remaining >= vec ? 0xFFFF
+                              : (remaining <= 0 ? 0 : (__mmask16)((1u << remaining) - 1u));
+        int valid = embed_dim - d;
+        if (valid <= 0) {
+            continue;
+        }
+        __mmask16 embed_mask = valid >= vec ? lane_mask
+                               : (__mmask16)((1u << valid) - 1u);
         
-        // Token embedding gradient (accumulate)
-        for (int d = 0; d < M->embed_dim; d++) {
-            float grad = d_embedded[t * M->aligned_embed_dim + d];
+        for (int t = 0; t < T; t++) {
+            __m512 grad_vec = _mm512_maskz_load_ps(embed_mask, d_embedded + t * aligned_dim + d);
+            int token_id = token_ids[t];
+            float *tok_ptr = d_token_emb + (size_t)token_id * aligned_dim + d;
+            __m512 tok_prev = _mm512_mask_load_ps(_mm512_setzero_ps(), embed_mask, tok_ptr);
+            _mm512_mask_store_ps(tok_ptr, embed_mask, _mm512_add_ps(tok_prev, grad_vec));
             
-            #pragma omp atomic
-            d_token_emb[token_id * M->aligned_embed_dim + d] += grad;
-            
-            #pragma omp atomic
-            d_pos_emb[t * M->aligned_embed_dim + d] += grad;
+            float *pos_ptr = d_pos_emb + (size_t)t * aligned_dim + d;
+            __m512 pos_prev = _mm512_mask_load_ps(_mm512_setzero_ps(), embed_mask, pos_ptr);
+            _mm512_mask_store_ps(pos_ptr, embed_mask, _mm512_add_ps(pos_prev, grad_vec));
         }
     }
 }
@@ -5246,7 +5259,7 @@ static void backward_fc2_reference(TransformerModel *M,
     //    [aligned_out × aligned_in] = [aligned_out × T] @ [T × aligned_in]
     // ============================================================================
     
-    #pragma omp parallel for collapse(2) num_threads(M->num_cores)
+    #pragma omp parallel for num_threads(M->num_cores)
     for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
         for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
             float grad_sum = 0.0f;
@@ -5254,7 +5267,6 @@ static void backward_fc2_reference(TransformerModel *M,
                 grad_sum += d_output[t * aligned_out + out_idx] *
                             fc2_input[t * aligned_in + in_idx];
             }
-            #pragma omp atomic
             d_W_fc2[out_idx * aligned_in + in_idx] += grad_sum;
         }
     }
@@ -5267,14 +5279,9 @@ static void backward_fc2_reference(TransformerModel *M,
     #pragma omp parallel for num_threads(M->num_cores)
     for (int d = 0; d < aligned_out; d++) {
         float bias_grad = 0.0f;
-        
-        // Sum gradient across all tokens
         for (int t = 0; t < T; t++) {
             bias_grad += d_output[t * aligned_out + d];
         }
-        
-        // Atomic accumulation
-        #pragma omp atomic
         d_b_fc2[d] += bias_grad;
     }
 }
@@ -5514,7 +5521,7 @@ static void backward_fc1_reference(TransformerModel *M,
     //    [aligned_out × aligned_in] = [aligned_out × T] @ [T × aligned_in]
     // ============================================================================
     
-    #pragma omp parallel for collapse(2) num_threads(M->num_cores)
+    #pragma omp parallel for num_threads(M->num_cores)
     for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
         for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
             float grad_sum = 0.0f;
@@ -5522,7 +5529,6 @@ static void backward_fc1_reference(TransformerModel *M,
                 grad_sum += d_output[t * aligned_out + out_idx] *
                             fc1_input[t * aligned_in + in_idx];
             }
-            #pragma omp atomic
             d_W_fc1[out_idx * aligned_in + in_idx] += grad_sum;
         }
     }
@@ -5537,7 +5543,6 @@ static void backward_fc1_reference(TransformerModel *M,
         for (int t = 0; t < T; t++) {
             bias_grad += d_output[t * aligned_out + out_idx];
         }
-        #pragma omp atomic
         d_b_fc1[out_idx] += bias_grad;
     }
 }
@@ -5745,11 +5750,7 @@ void backward_layernorm(TransformerModel *M,
             beta_grad += d_y;
         }
         
-        // Atomic accumulation (in case of multiple backward passes)
-        #pragma omp atomic
         d_gamma[d] += gamma_grad;
-        
-        #pragma omp atomic
         d_beta[d] += beta_grad;
     }
 }
@@ -5778,6 +5779,49 @@ void add_gradient(TransformerModel *M,
     #pragma omp parallel for num_threads(M->num_cores)
     for (size_t i = 0; i < total_elements; i++) {
         dest[i] += source[i];
+    }
+}
+
+static inline void accumulate_linear_weight_bias_feature_parallel(
+    TransformerModel *M,
+    float *input,
+    float *scratch,
+    float *d_weights,
+    float *d_bias,
+    int aligned_in,
+    int aligned_out,
+    int T)
+{
+    const int vector_width = 16;
+
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(M->num_cores)
+    for (int out_idx = 0; out_idx < aligned_out; ++out_idx) {
+        float bias_sum = 0.0f;
+        float *dst_row = d_weights + (size_t)out_idx * aligned_in;
+
+        for (int in_idx = 0; in_idx < aligned_in; in_idx += vector_width) {
+            int remaining = aligned_in - in_idx;
+            __mmask16 mask = remaining >= vector_width
+                                 ? 0xFFFF
+                                 : (remaining <= 0 ? 0 : (__mmask16)((1u << remaining) - 1u));
+
+            __m512 accum = _mm512_setzero_ps();
+            for (int t = 0; t < T; ++t) {
+                float grad_scalar = scratch[t * aligned_out + out_idx];
+                __m512 grad_vec = _mm512_set1_ps(grad_scalar);
+                __m512 input_vec = _mm512_maskz_load_ps(
+                    mask, input + (size_t)t * aligned_in + in_idx);
+                accum = _mm512_fmadd_ps(grad_vec, input_vec, accum);
+            }
+
+            __m512 prev = _mm512_mask_load_ps(_mm512_setzero_ps(), mask, dst_row + in_idx);
+            _mm512_mask_store_ps(dst_row + in_idx, mask, _mm512_add_ps(prev, accum));
+        }
+
+        for (int t = 0; t < T; ++t) {
+            bias_sum += scratch[t * aligned_out + out_idx];
+        }
+        d_bias[out_idx] += bias_sum;
     }
 }
 
@@ -5857,29 +5901,15 @@ void backward_attention_projection(TransformerModel *M,
         }
     }
     
-    // 3. Compute d_W_proj = attention^T @ d_output
-    #pragma omp parallel for collapse(2) num_threads(M->num_cores)
-    for (int row = 0; row < aligned_dim; row++) {
-        for (int col = 0; col < aligned_dim; col++) {
-            float grad_sum = 0.0f;
-            for (int t = 0; t < T; t++) {
-                grad_sum += attention_output[t * aligned_dim + col] * d_output[t * aligned_dim + row];
-            }
-            #pragma omp atomic
-            d_W_proj[row * aligned_dim + col] += grad_sum;
-        }
-    }
-    
-    // 4. Compute d_b_proj = sum(d_output) over tokens
-    #pragma omp parallel for num_threads(M->num_cores)
-    for (int d = 0; d < aligned_dim; d++) {
-        float bias_grad = 0.0f;
-        for (int t = 0; t < T; t++) {
-            bias_grad += d_output[t * aligned_dim + d];
-        }
-        #pragma omp atomic
-        d_b_proj[d] += bias_grad;
-    }
+    accumulate_linear_weight_bias_feature_parallel(
+        M,
+        attention_output,
+        d_output,
+        d_W_proj,
+        d_b_proj,
+        aligned_dim,
+        aligned_dim,
+        T);
 }
 
 /**
@@ -5932,17 +5962,29 @@ void backward_attention_weighted_values(TransformerModel *M,
                 ATTN_ACCESS(d_weights, h, t, s, T) = grad_sum;
             }
             
-            // 2. Accumulate d_V[h,s,d]
-            // For each position s that attended to by t
-            for (int s = 0; s <= t; s++) { // Causal: t can only attend to s <= t
-                float weight = ATTN_ACCESS(attention_weights, h, t, s, T);
-                
-                for (int d = 0; d < head_dim; d++) {
-                    float d_out = Q_ACCESS(d_output, h, t, d, T, aligned_head_dim);
-                    
-                    #pragma omp atomic
-                    V_ACCESS(d_v, h, s, d, T, aligned_head_dim) += weight * d_out;
+        }
+    }
+    
+    const int vec = 16;
+    #pragma omp parallel for collapse(2) schedule(dynamic, 1) num_threads(M->num_cores)
+    for (int h = 0; h < H; h++) {
+        for (int s = 0; s < T; s++) {
+            for (int d = 0; d < head_dim; d += vec) {
+                int remaining = head_dim - d;
+                __mmask16 mask = remaining >= vec ? 0xFFFF
+                                    : (remaining <= 0 ? 0 : (__mmask16)((1u << remaining) - 1u));
+                __m512 accum = _mm512_setzero_ps();
+                for (int t = s; t < T; t++) {
+                    float weight = ATTN_ACCESS(attention_weights, h, t, s, T);
+                    __m512 grad_vec = _mm512_maskz_load_ps(mask,
+                        &Q_ACCESS(d_output, h, t, d, T, aligned_head_dim));
+                    __m512 weight_vec = _mm512_set1_ps(weight);
+                    accum = _mm512_fmadd_ps(weight_vec, grad_vec, accum);
                 }
+                _mm512_mask_store_ps(&V_ACCESS(d_v, h, s, d, T, aligned_head_dim), mask, accum);
+            }
+            for (int d = head_dim; d < aligned_head_dim; d++) {
+                V_ACCESS(d_v, h, s, d, T, aligned_head_dim) = 0.0f;
             }
         }
     }
@@ -6119,17 +6161,20 @@ void backward_qk_matmul(TransformerModel *M,
                 Q_ACCESS(d_q, h, i, d, T, aligned_head_dim) = grad_sum * scale;
             }
             
-            // Compute d_K[h,j,d] contributions from query i
-            // For each key position j that was attended to by query i
-            for (int j = 0; j <= i; j++) {  // Causal: only j <= i
-                float d_score = ATTN_ACCESS(d_scores, h, i, j, T);
-                
-                for (int d = 0; d < head_dim; d++) {
+        }
+    }
+
+    #pragma omp parallel for collapse(2) schedule(dynamic, 1) num_threads(M->num_cores)
+    for (int h = 0; h < H; h++) {
+        for (int j = 0; j < T; j++) {
+            for (int d = 0; d < head_dim; d++) {
+                float grad_sum = 0.0f;
+                for (int i = j; i < T; i++) {
+                    float d_score = ATTN_ACCESS(d_scores, h, i, j, T);
                     float q_val = Q_ACCESS(q_values, h, i, d, T, aligned_head_dim);
-                    
-                    #pragma omp atomic
-                    K_ACCESS(d_k, h, j, d, T, aligned_head_dim) += d_score * q_val * scale;
+                    grad_sum += d_score * q_val;
                 }
+                K_ACCESS(d_k, h, j, d, T, aligned_head_dim) = grad_sum * scale;
             }
         }
     }
@@ -6166,50 +6211,7 @@ static void reshape_qkv_grad_to_token_major(TransformerModel *M,
     }
 }
 
-static inline void accumulate_linear_weight_bias_feature_parallel(
-    TransformerModel *M,
-    float *input,
-    float *scratch,
-    float *d_weights,
-    float *d_bias,
-    int aligned_in,
-    int aligned_out,
-    int T)
-{
-    const int vector_width = 16;
-
-    #pragma omp parallel for schedule(dynamic, 1) num_threads(M->num_cores)
-    for (int out_idx = 0; out_idx < aligned_out; ++out_idx) {
-        float bias_sum = 0.0f;
-        float *dst_row = d_weights + (size_t)out_idx * aligned_in;
-
-        for (int in_idx = 0; in_idx < aligned_in; in_idx += vector_width) {
-            int remaining = aligned_in - in_idx;
-            __mmask16 mask = remaining >= vector_width
-                                 ? 0xFFFF
-                                 : (remaining <= 0 ? 0 : (__mmask16)((1u << remaining) - 1u));
-
-            __m512 accum = _mm512_setzero_ps();
-            for (int t = 0; t < T; ++t) {
-                float grad_scalar = scratch[t * aligned_out + out_idx];
-                __m512 grad_vec = _mm512_set1_ps(grad_scalar);
-                __m512 input_vec = _mm512_maskz_load_ps(
-                    mask, input + (size_t)t * aligned_in + in_idx);
-                accum = _mm512_fmadd_ps(grad_vec, input_vec, accum);
-            }
-
-            __m512 prev = _mm512_mask_load_ps(_mm512_setzero_ps(), mask, dst_row + in_idx);
-            _mm512_mask_store_ps(dst_row + in_idx, mask, _mm512_add_ps(prev, accum));
-        }
-
-        for (int t = 0; t < T; ++t) {
-            bias_sum += scratch[t * aligned_out + out_idx];
-        }
-        d_bias[out_idx] += bias_sum;
-    }
-}
-
-/**
+/** 
  * BACKWARD THROUGH LINEAR LAYER (GENERIC)
  * 
  * Forward: output = input @ W + bias
@@ -6261,14 +6263,13 @@ static void backward_linear_reference(TransformerModel *M,
     }
     
     // 2. d_W = input^T @ d_output  (matches forward row-major layout: [out][in])
-    #pragma omp parallel for collapse(2) num_threads(M->num_cores)
+    #pragma omp parallel for num_threads(M->num_cores)
     for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
         for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
             float sum = 0.0f;
             for (int t = 0; t < T; t++) {
                 sum += input[t * aligned_in + in_idx] * scratch[t * aligned_out + out_idx];
             }
-            #pragma omp atomic
             d_weights[out_idx * aligned_in + in_idx] += sum;
         }
     }
@@ -6280,7 +6281,6 @@ static void backward_linear_reference(TransformerModel *M,
         for (int t = 0; t < T; t++) {
             sum += scratch[t * aligned_out + out_idx];
         }
-        #pragma omp atomic
         d_bias[out_idx] += sum;
     }
 }
@@ -6405,15 +6405,10 @@ void backward_lm_head(TransformerModel *M) {
     for (int v = 0; v < M->vocab_size; v++) {
         for (int d = 0; d < M->embed_dim; d++) {
             float grad_sum = 0.0f;
-            
-            // Sum over all tokens in the batch
             for (int t = 0; t < M->context_window; t++) {
-                grad_sum += d_logits[t * M->vocab_size + v] * 
+                grad_sum += d_logits[t * M->vocab_size + v] *
                            final_ln_output[t * M->aligned_embed_dim + d];
             }
-            
-            // Accumulate (in case of multiple backward passes before update)
-            #pragma omp atomic
             d_embed_weights[v * M->aligned_embed_dim + d] += grad_sum;
         }
     }
@@ -6935,6 +6930,8 @@ static void run_training_loop(TransformerModel *M,
     const char *last_sample_path = list->paths[0];
     printf("\n🎯 Starting training loop (%d steps, lr=%.6f) using preloaded data from %s\n",
            total_steps, learning_rate, train_dir);
+    double training_start = get_time_sec();
+    double last_log_time = training_start;
     
     bool canary_verified_once = false;
     
@@ -6958,9 +6955,15 @@ static void run_training_loop(TransformerModel *M,
         }
         
         if ((step + 1) % log_interval == 0 || step == 0) {
+            double now = get_time_sec();
+            double window = now - last_log_time;
+            double total_elapsed = now - training_start;
+            double steps_per_sec = (total_elapsed > 0.0) ? ((double)(step + 1) / total_elapsed) : 0.0;
             float ppl = expf(loss);
-            printf("[train] step=%d/%d  loss=%.6f  perplexity=%.2f  sample=%s\n",
-                   step + 1, total_steps, loss, ppl, last_sample_path);
+            printf("[train] step=%d/%d  loss=%.6f  perplexity=%.2f  sample=%s  Δt=%.2fs  total=%.2fs  steps/s=%.2f\n",
+                   step + 1, total_steps, loss, ppl, last_sample_path,
+                   window, total_elapsed, steps_per_sec);
+            last_log_time = now;
         }
         
         if (checkpoints_enabled && checkpoint_interval > 0 &&
@@ -6974,7 +6977,9 @@ static void run_training_loop(TransformerModel *M,
         }
     }
     
-    printf("✅ Training complete.\n");
+    double training_total = get_time_sec() - training_start;
+    double avg_steps_per_sec = (training_total > 0.0) ? ((double)total_steps / training_total) : 0.0;
+    printf("✅ Training complete. ⏱️  total=%.2fs  avg steps/s=%.2f\n", training_total, avg_steps_per_sec);
     
     if (checkpoints_enabled) {
         char final_path[PATH_MAX];
