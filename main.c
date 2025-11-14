@@ -1,7 +1,7 @@
 /**
  * @file main.c
  * @brief CPU-Optimized Large Language Model Runtime (x86-64)
- * @author ANTSHIV ROBOTICS
+ * @author Anthony Shivakumar
  * @version 1.0
  * @date 2025
  *
@@ -24,26 +24,6 @@
  *   - **Token-level parallelism** for prompt processing.
  *   - **Head-level parallelism** for attention computation.
  *   - A fixed batch size of 1, optimized for real-time inference.
- *
- * @section why_cpu Why Focus on CPUs? The Strategic Bet
- *
- * The prevailing narrative suggests GPUs are the only viable platform for serious AI. This project challenges that notion by arguing that the true comparison is not "CPU vs. GPU," but rather the **Open CPU Ecosystem** versus the **Proprietary NVIDIA Ecosystem**.
- *
- * ### The CPU Advantage: A Bet on Open, Commodity Hardware
- *
- * We believe that the relentless pace of open hardware development will make CPUs an increasingly powerful and cost-effective platform for AI.
- *
- * - **Massive, Affordable Memory**: The latest Intel Xeon and AMD EPYC CPUs support up to 12 channels of DDR5 memory per socket, with DDR6 on the horizon. This allows entire large models (175B+ parameters) to reside in high-bandwidth, commodity DRAM, eliminating the PCIe bottleneck and HBM capacity limits inherent to GPUs.
- *
- * - **Explosive Parallelism**: With core counts exceeding 128 per socket and advanced SIMD instruction sets like AVX-512 for 1D tensor math and AMX for 2D matrix math, CPUs are becoming massively parallel compute engines in their own right.
- *
- * - **Accelerated Data Movement**: On-chip accelerators like Intel's Data Streaming Accelerator (DSA) and DMA engines on ARM offload memory copy operations, freeing up compute cores to focus on arithmetic.
- *
- * - **Freedom from Vendor Lock-In**: The entire CPU ecosystem is built on commodity hardware and open standards. There is no proprietary lock-in equivalent to NVIDIA's CUDA. This fosters competition, drives down cost, and guarantees that performance gains from new hardware generations (e.g., DDR6, 600 Gb/s Ethernet) are immediately accessible without being tied to a single vendor's roadmap.
- *
- * ### The Long-Term Vision
- *
- * As AI models become more efficient and capable, the raw performance gap between CPUs and specialized accelerators will narrow. The combination of ever-improving commodity hardware and sophisticated, cache-aware software design makes the CPU a powerful, open, and increasingly competitive contender for both inference and training. **This project is a bet on that future.**
  *
  * @section architecture System Architecture
  *
@@ -75,6 +55,10 @@
 #include <stdbool.h>
 #include <assert.h>
 #include <dirent.h>
+#define USE_FEATURE_PARALLEL_FC2 1
+#ifndef USE_FEATURE_PARALLEL_LINEAR
+#define USE_FEATURE_PARALLEL_LINEAR 1
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <limits.h>
@@ -371,7 +355,10 @@ typedef struct {
     LayerGradients* layers;         // Array of per-layer gradient structs
     
     size_t d_pos_embed_offset;                 // [T × D] positional embedding gradients
-    size_t training_pair_tokens_offset;        // [T+1] token buffer for training data loader
+    size_t training_pair_tokens_offset;        // Base of cached training data inside arena
+    size_t training_pair_tokens_count;         // Actual tokens stored per sample (context + target)
+    size_t training_pair_tokens_stride;        // Padded stride (floats) between samples
+    size_t training_pair_capacity;             // Number of samples cached in arena
     
     size_t layer_backprop_stride;              // Distance between layers
     
@@ -492,6 +479,13 @@ typedef struct
     GradientStorage gradients;  ///< Gradient and activation cache memory (training only)
     bool training_enabled;      ///< Whether gradient storage is allocated
     float learning_rate;        ///< SGD learning rate for weight updates
+    size_t training_cache_samples; ///< Number of training windows cached inside arena
+
+    /* ═══════════════════════════════════════════════════════════════════ */
+    /* Preloaded Training Data (Optimization)                                */
+    /* ═══════════════════════════════════════════════════════════════════ */
+    long* training_data_buffer; ///< Pointer to in-memory buffer for the entire training dataset
+    long num_training_tokens;   ///< Total number of tokens in the preloaded dataset
 
     /* ═══════════════════════════════════════════════════════════════════ */
     /* File Integrity                                                        */
@@ -698,10 +692,19 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
     M->gradients.d_pos_embed_offset = bump(&off, T * D, CACHE_ALIGN);
     
     if (M->training_enabled) {
-        size_t tokens_needed = (size_t)T + 1; // input context + next-token target
-        M->gradients.training_pair_tokens_offset = bump(&off, tokens_needed, CACHE_ALIGN);
+        size_t tokens_per_pair = (size_t)T + 1; // context + next-token target
+        size_t stride_floats = align_up(tokens_per_pair * sizeof(float), CACHE_ALIGN) / sizeof(float);
+        size_t cache_slots = M->training_cache_samples ? M->training_cache_samples : 1;
+        size_t total_tokens = stride_floats * cache_slots;
+        M->gradients.training_pair_tokens_offset = bump(&off, total_tokens, CACHE_ALIGN);
+        M->gradients.training_pair_tokens_count = tokens_per_pair;
+        M->gradients.training_pair_tokens_stride = stride_floats;
+        M->gradients.training_pair_capacity = cache_slots;
     } else {
         M->gradients.training_pair_tokens_offset = 0;
+        M->gradients.training_pair_tokens_count = 0;
+        M->gradients.training_pair_tokens_stride = 0;
+        M->gradients.training_pair_capacity = 0;
     }
     // M->gradients.d_embed_weights_offset  <- embed weigths is again used but we have allcoated this pointer above. 
     
@@ -893,6 +896,9 @@ static void ensure_model_header_defaults(TransformerModel *M) {
     M->model_type = 0;
     memset(M->checksum, 0, sizeof(M->checksum));
     memset(M->reserved, 0, sizeof(M->reserved));
+    M->training_data_buffer = NULL;
+    M->num_training_tokens = 0;
+    M->training_cache_samples = 0;
 }
 
 void destroy_transformer(TransformerModel *M)
@@ -901,6 +907,9 @@ void destroy_transformer(TransformerModel *M)
     free(M->layers);
     if (M->training_enabled  && M->gradients.layers) {
         free(M->gradients.layers);
+    }
+    if (M->training_data_buffer) {
+        free(M->training_data_buffer);
     }
 }
 
@@ -5192,14 +5201,14 @@ void backward_final_layernorm(TransformerModel *M) {
  * - Memory bandwidth bound due to large weight matrix (4D×D)
  * - Cache blocking beneficial for weight gradient accumulation
  */
-void backward_fc2(TransformerModel *M,
-                  size_t d_output_offset,      // [T × D] incoming gradient
-                  size_t fc2_input_copy_offset, // [T × 4D] cached forward activation
-                  size_t fc2_weight_offset,     // [4D × D] weight matrix
-                  size_t fc2_bias_offset,       // [D] bias vector
-                  size_t d_input_offset,        // [T × 4D] gradient to compute
-                  size_t d_weight_offset,       // [4D × D] weight gradient to accumulate
-                  size_t d_bias_offset)         // [D] bias gradient to accumulate
+static void backward_fc2_reference(TransformerModel *M,
+                                   size_t d_output_offset,
+                                   size_t fc2_input_copy_offset,
+                                   size_t fc2_weight_offset,
+                                   size_t fc2_bias_offset,
+                                   size_t d_input_offset,
+                                   size_t d_weight_offset,
+                                   size_t d_bias_offset)
 {
     float *d_output = M->memory_base + d_output_offset;
     float *fc2_input = M->memory_base + fc2_input_copy_offset;
@@ -5341,6 +5350,91 @@ void backward_gelu(TransformerModel *M,
     }
 }
 
+static void backward_fc2_feature_parallel(TransformerModel *M,
+                                          size_t d_output_offset,
+                                          size_t fc2_input_copy_offset,
+                                          size_t fc2_weight_offset,
+                                          size_t fc2_bias_offset,
+                                          size_t d_input_offset,
+                                          size_t d_weight_offset,
+                                          size_t d_bias_offset)
+{
+    float *d_output = M->memory_base + d_output_offset;
+    float *fc2_input = M->memory_base + fc2_input_copy_offset;
+    float *W_fc2 = M->memory_base + fc2_weight_offset;
+    float *d_input = M->memory_base + d_input_offset;
+    float *d_W_fc2 = M->memory_base + d_weight_offset;
+    float *d_b_fc2 = M->memory_base + d_bias_offset;
+    
+    int T = M->context_window;
+    int aligned_out = M->aligned_embed_dim;      // D (output dimension, padded)
+    int aligned_in = 4 * M->aligned_embed_dim;   // 4D (input dimension, padded)
+    
+    // --- 1. d_input = d_output @ W_fc2^T (same as reference implementation) ---
+    #pragma omp parallel for num_threads(M->num_cores)
+    for (int t = 0; t < T; t++) {
+        float *d_out_row = d_output + t * aligned_out;
+        float *d_in_row = d_input + t * aligned_in;
+        
+        for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
+            float sum = 0.0f;
+            for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+                sum += d_out_row[out_idx] * W_fc2[out_idx * aligned_in + in_idx];
+            }
+            d_in_row[in_idx] = sum;
+        }
+    }
+    
+    // --- 2. d_W_fc2 = d_output^T @ fc2_input (feature-parallel, vectorized) ---
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(M->num_cores)
+    for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+        float *dst_row = d_W_fc2 + out_idx * aligned_in;
+        
+        for (int in_idx = 0; in_idx < aligned_in; in_idx += 16) {
+            __m512 accum = _mm512_setzero_ps();
+            
+            for (int t = 0; t < T; t++) {
+                __m512 input_vec = _mm512_load_ps(fc2_input + t * aligned_in + in_idx);
+                __m512 grad_broadcast = _mm512_set1_ps(d_output[t * aligned_out + out_idx]);
+                accum = _mm512_fmadd_ps(grad_broadcast, input_vec, accum);
+            }
+            
+            __m512 prev = _mm512_load_ps(dst_row + in_idx);
+            _mm512_store_ps(dst_row + in_idx, _mm512_add_ps(prev, accum));
+        }
+    }
+    
+    // --- 3. d_b_fc2 = sum_over_T(d_output) (feature-parallel, no atomics) ---
+    #pragma omp parallel for schedule(static) num_threads(M->num_cores)
+    for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+        float bias_grad = 0.0f;
+        for (int t = 0; t < T; t++) {
+            bias_grad += d_output[t * aligned_out + out_idx];
+        }
+        d_b_fc2[out_idx] += bias_grad;
+    }
+}
+
+void backward_fc2(TransformerModel *M,
+                  size_t d_output_offset,
+                  size_t fc2_input_copy_offset,
+                  size_t fc2_weight_offset,
+                  size_t fc2_bias_offset,
+                  size_t d_input_offset,
+                  size_t d_weight_offset,
+                  size_t d_bias_offset)
+{
+#if USE_FEATURE_PARALLEL_FC2
+    backward_fc2_feature_parallel(M, d_output_offset, fc2_input_copy_offset,
+                                  fc2_weight_offset, fc2_bias_offset,
+                                  d_input_offset, d_weight_offset, d_bias_offset);
+#else
+    backward_fc2_reference(M, d_output_offset, fc2_input_copy_offset,
+                           fc2_weight_offset, fc2_bias_offset,
+                           d_input_offset, d_weight_offset, d_bias_offset);
+#endif
+}
+
 /**
  * ============================================================================
  * BACKWARD THROUGH FC1 (Feed-Forward Layer 1)
@@ -5375,14 +5469,14 @@ void backward_gelu(TransformerModel *M,
  * - Consider chunking for better cache reuse
  * - Token parallelism for d_input computation
  */
-void backward_fc1(TransformerModel *M,
-                  size_t d_output_offset,      // [T × 4D] incoming gradient
-                  size_t fc1_input_copy_offset, // [T × D] cached forward activation
-                  size_t fc1_weight_offset,     // [D × 4D] weight matrix
-                  size_t fc1_bias_offset,       // [4D] bias vector
-                  size_t d_input_offset,        // [T × D] gradient to compute
-                  size_t d_weight_offset,       // [D × 4D] weight gradient to accumulate
-                  size_t d_bias_offset)         // [4D] bias gradient to accumulate
+static void backward_fc1_reference(TransformerModel *M,
+                                   size_t d_output_offset,
+                                   size_t fc1_input_copy_offset,
+                                   size_t fc1_weight_offset,
+                                   size_t fc1_bias_offset,
+                                   size_t d_input_offset,
+                                   size_t d_weight_offset,
+                                   size_t d_bias_offset)
 {
     float *d_output = M->memory_base + d_output_offset;
     float *fc1_input = M->memory_base + fc1_input_copy_offset;
@@ -5446,6 +5540,86 @@ void backward_fc1(TransformerModel *M,
         #pragma omp atomic
         d_b_fc1[out_idx] += bias_grad;
     }
+}
+
+static void backward_fc1_feature_parallel(TransformerModel *M,
+                                          size_t d_output_offset,
+                                          size_t fc1_input_copy_offset,
+                                          size_t fc1_weight_offset,
+                                          size_t fc1_bias_offset,
+                                          size_t d_input_offset,
+                                          size_t d_weight_offset,
+                                          size_t d_bias_offset)
+{
+    float *d_output = M->memory_base + d_output_offset;
+    float *fc1_input = M->memory_base + fc1_input_copy_offset;
+    float *W_fc1 = M->memory_base + fc1_weight_offset;
+    float *d_input = M->memory_base + d_input_offset;
+    float *d_W_fc1 = M->memory_base + d_weight_offset;
+    float *d_b_fc1 = M->memory_base + d_bias_offset;
+    
+    int T = M->context_window;
+    int aligned_in = M->aligned_embed_dim;
+    int aligned_out = 4 * M->aligned_embed_dim;
+    
+    #pragma omp parallel for num_threads(M->num_cores)
+    for (int t = 0; t < T; t++) {
+        float *d_out_row = d_output + t * aligned_out;
+        float *d_in_row = d_input + t * aligned_in;
+        
+        for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
+            float sum = 0.0f;
+            for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+                sum += d_out_row[out_idx] * W_fc1[out_idx * aligned_in + in_idx];
+            }
+            d_in_row[in_idx] = sum;
+        }
+    }
+    
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(M->num_cores)
+    for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+        float *dst_row = d_W_fc1 + out_idx * aligned_in;
+        
+        for (int in_idx = 0; in_idx < aligned_in; in_idx += 16) {
+            __m512 accum = _mm512_setzero_ps();
+            for (int t = 0; t < T; t++) {
+                __m512 input_vec = _mm512_load_ps(fc1_input + t * aligned_in + in_idx);
+                __m512 grad_broadcast = _mm512_set1_ps(d_output[t * aligned_out + out_idx]);
+                accum = _mm512_fmadd_ps(grad_broadcast, input_vec, accum);
+            }
+            __m512 prev = _mm512_load_ps(dst_row + in_idx);
+            _mm512_store_ps(dst_row + in_idx, _mm512_add_ps(prev, accum));
+        }
+    }
+    
+    #pragma omp parallel for schedule(static) num_threads(M->num_cores)
+    for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+        float bias_grad = 0.0f;
+        for (int t = 0; t < T; t++) {
+            bias_grad += d_output[t * aligned_out + out_idx];
+        }
+        d_b_fc1[out_idx] += bias_grad;
+    }
+}
+
+void backward_fc1(TransformerModel *M,
+                  size_t d_output_offset,
+                  size_t fc1_input_copy_offset,
+                  size_t fc1_weight_offset,
+                  size_t fc1_bias_offset,
+                  size_t d_input_offset,
+                  size_t d_weight_offset,
+                  size_t d_bias_offset)
+{
+#if USE_FEATURE_PARALLEL_FC2
+    backward_fc1_feature_parallel(M, d_output_offset, fc1_input_copy_offset,
+                                  fc1_weight_offset, fc1_bias_offset,
+                                  d_input_offset, d_weight_offset, d_bias_offset);
+#else
+    backward_fc1_reference(M, d_output_offset, fc1_input_copy_offset,
+                           fc1_weight_offset, fc1_bias_offset,
+                           d_input_offset, d_weight_offset, d_bias_offset);
+#endif
 }
 
 /**
@@ -5961,6 +6135,80 @@ void backward_qk_matmul(TransformerModel *M,
     }
 }
 
+static void reshape_qkv_grad_to_token_major(TransformerModel *M,
+                                            size_t d_output_offset,
+                                            size_t scratch_offset) {
+    float *d_output = M->memory_base + d_output_offset;
+    float *scratch = M->memory_base + scratch_offset;
+    int T = M->context_window;
+    int aligned_dim = M->aligned_embed_dim;
+    int embed_dim = M->embed_dim;
+    int head_dim = M->head_dim;
+    int aligned_head_dim = M->aligned_head_dim;
+    int H = M->num_attention_heads;
+
+    #pragma omp parallel for collapse(2) num_threads(M->num_cores)
+    for (int t = 0; t < T; t++) {
+        for (int h = 0; h < H; h++) {
+            for (int d = 0; d < head_dim; d++) {
+                int global_dim = h * head_dim + d;
+                scratch[t * aligned_dim + global_dim] =
+                    Q_ACCESS(d_output, h, t, d, T, aligned_head_dim);
+            }
+        }
+    }
+
+    #pragma omp parallel for num_threads(M->num_cores)
+    for (int t = 0; t < T; t++) {
+        for (int d = embed_dim; d < aligned_dim; d++) {
+            scratch[t * aligned_dim + d] = 0.0f;
+        }
+    }
+}
+
+static inline void accumulate_linear_weight_bias_feature_parallel(
+    TransformerModel *M,
+    float *input,
+    float *scratch,
+    float *d_weights,
+    float *d_bias,
+    int aligned_in,
+    int aligned_out,
+    int T)
+{
+    const int vector_width = 16;
+
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(M->num_cores)
+    for (int out_idx = 0; out_idx < aligned_out; ++out_idx) {
+        float bias_sum = 0.0f;
+        float *dst_row = d_weights + (size_t)out_idx * aligned_in;
+
+        for (int in_idx = 0; in_idx < aligned_in; in_idx += vector_width) {
+            int remaining = aligned_in - in_idx;
+            __mmask16 mask = remaining >= vector_width
+                                 ? 0xFFFF
+                                 : (remaining <= 0 ? 0 : (__mmask16)((1u << remaining) - 1u));
+
+            __m512 accum = _mm512_setzero_ps();
+            for (int t = 0; t < T; ++t) {
+                float grad_scalar = scratch[t * aligned_out + out_idx];
+                __m512 grad_vec = _mm512_set1_ps(grad_scalar);
+                __m512 input_vec = _mm512_maskz_load_ps(
+                    mask, input + (size_t)t * aligned_in + in_idx);
+                accum = _mm512_fmadd_ps(grad_vec, input_vec, accum);
+            }
+
+            __m512 prev = _mm512_mask_load_ps(_mm512_setzero_ps(), mask, dst_row + in_idx);
+            _mm512_mask_store_ps(dst_row + in_idx, mask, _mm512_add_ps(prev, accum));
+        }
+
+        for (int t = 0; t < T; ++t) {
+            bias_sum += scratch[t * aligned_out + out_idx];
+        }
+        d_bias[out_idx] += bias_sum;
+    }
+}
+
 /**
  * BACKWARD THROUGH LINEAR LAYER (GENERIC)
  * 
@@ -5974,54 +6222,29 @@ void backward_qk_matmul(TransformerModel *M,
  * d_W += input^T @ d_output
  * d_bias += sum(d_output)
  */
-void backward_linear(TransformerModel *M,
-                    size_t d_output_offset,    // Gradient from head-major QKV
-                    size_t input_copy_offset,  // [T×D] cached LN1 output
-                    size_t weight_offset,      // [D×D] weights
-                    size_t bias_offset,        // [D] bias
-                    size_t d_input_offset,     // [T×D] gradient to accumulate
-                    size_t d_weight_offset,    // [D×D] weight gradient
-                    size_t d_bias_offset,      // [D] bias gradient
-                    size_t scratch_offset)     // [T×D] scratch buffer
-{
-    float *d_output = M->memory_base + d_output_offset;
+static void backward_linear_reference(TransformerModel *M,
+                                      size_t d_output_offset,
+                                      size_t input_copy_offset,
+                                      size_t weight_offset,
+                                      size_t bias_offset,
+                                      size_t d_input_offset,
+                                      size_t d_weight_offset,
+                                      size_t d_bias_offset,
+                                      size_t scratch_offset) {
     float *input = M->memory_base + input_copy_offset;
     float *weights = M->memory_base + weight_offset;
     float *d_input = M->memory_base + d_input_offset;
     float *d_weights = M->memory_base + d_weight_offset;
     float *d_bias = M->memory_base + d_bias_offset;
-    float *scratch = M->memory_base + scratch_offset; // [T × D] buffer for reshaping
-    
+    float *scratch = M->memory_base + scratch_offset;
+
+    reshape_qkv_grad_to_token_major(M, d_output_offset, scratch_offset);
+
     int T = M->context_window;
     int aligned_dim = M->aligned_embed_dim;
-    int embed_dim = M->embed_dim;
-    int head_dim = M->head_dim;
-    int aligned_head_dim = M->aligned_head_dim;
-    int H = M->num_attention_heads;
-    
-    // Reshape from head-major [H×T×head_dim] to token-major [T×D]
-    #pragma omp parallel for collapse(2) num_threads(M->num_cores)
-    for (int t = 0; t < T; t++) {
-        for (int h = 0; h < H; h++) {
-            for (int d = 0; d < head_dim; d++) {
-                int global_dim = h * head_dim + d;
-                scratch[t * aligned_dim + global_dim] =
-                    Q_ACCESS(d_output, h, t, d, T, aligned_head_dim);
-            }
-        }
-    }
-
-    // Zero padding lanes that do not correspond to real model dims
-    #pragma omp parallel for num_threads(M->num_cores)
-    for (int t = 0; t < T; t++) {
-        for (int d = embed_dim; d < aligned_dim; d++) {
-            scratch[t * aligned_dim + d] = 0.0f;
-        }
-    }
-    
-    int aligned_out = aligned_dim;  // Output dim equals input dim for Q/K/V projections
+    int aligned_out = aligned_dim;
     int aligned_in = aligned_dim;
-    
+
     // 1. d_input = d_output @ W^T (accumulate!)
     #pragma omp parallel for num_threads(M->num_cores)
     for (int t = 0; t < T; t++) {
@@ -6033,7 +6256,6 @@ void backward_linear(TransformerModel *M,
             for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
                 sum += d_out_row[out_idx] * weights[out_idx * aligned_in + in_idx];
             }
-            #pragma omp atomic
             d_in_row[in_idx] += sum;
         }
     }
@@ -6061,6 +6283,71 @@ void backward_linear(TransformerModel *M,
         #pragma omp atomic
         d_bias[out_idx] += sum;
     }
+}
+
+#if USE_FEATURE_PARALLEL_LINEAR
+static void backward_linear_feature_parallel(TransformerModel *M,
+                                             size_t d_output_offset,
+                                             size_t input_copy_offset,
+                                             size_t weight_offset,
+                                             size_t bias_offset,
+                                             size_t d_input_offset,
+                                             size_t d_weight_offset,
+                                             size_t d_bias_offset,
+                                             size_t scratch_offset) {
+    float *input = M->memory_base + input_copy_offset;
+    float *weights = M->memory_base + weight_offset;
+    float *d_input = M->memory_base + d_input_offset;
+    float *d_weights = M->memory_base + d_weight_offset;
+    float *d_bias = M->memory_base + d_bias_offset;
+    float *scratch = M->memory_base + scratch_offset;
+
+    reshape_qkv_grad_to_token_major(M, d_output_offset, scratch_offset);
+
+    int T = M->context_window;
+    int aligned_dim = M->aligned_embed_dim;
+    int aligned_out = aligned_dim;
+    int aligned_in = aligned_dim;
+
+    #pragma omp parallel for num_threads(M->num_cores)
+    for (int t = 0; t < T; t++) {
+        float *d_out_row = scratch + t * aligned_out;
+        float *d_in_row = d_input + t * aligned_in;
+
+        for (int in_idx = 0; in_idx < aligned_in; in_idx++) {
+            float sum = 0.0f;
+            for (int out_idx = 0; out_idx < aligned_out; out_idx++) {
+                sum += d_out_row[out_idx] * weights[out_idx * aligned_in + in_idx];
+            }
+            d_in_row[in_idx] += sum;
+        }
+    }
+
+    accumulate_linear_weight_bias_feature_parallel(
+        M, input, scratch, d_weights, d_bias, aligned_in, aligned_out, T);
+}
+#endif
+
+void backward_linear(TransformerModel *M,
+                    size_t d_output_offset,
+                    size_t input_copy_offset,
+                    size_t weight_offset,
+                    size_t bias_offset,
+                    size_t d_input_offset,
+                    size_t d_weight_offset,
+                    size_t d_bias_offset,
+                    size_t scratch_offset) {
+#if USE_FEATURE_PARALLEL_LINEAR
+    backward_linear_feature_parallel(M, d_output_offset, input_copy_offset,
+                                     weight_offset, bias_offset,
+                                     d_input_offset, d_weight_offset,
+                                     d_bias_offset, scratch_offset);
+#else
+    backward_linear_reference(M, d_output_offset, input_copy_offset,
+                              weight_offset, bias_offset,
+                              d_input_offset, d_weight_offset,
+                              d_bias_offset, scratch_offset);
+#endif
 }
 
 void backward_lm_head(TransformerModel *M) {
@@ -6506,23 +6793,93 @@ static bool build_training_pair_list(const char *dir_path, TrainingPairList *out
     return true;
 }
 
-static bool load_training_window(const char *file_path,
-                                 int context_len,
-                                 uint32_t *buffer) {
-    size_t total = (size_t)context_len + 1;
-    FILE *fp = fopen(file_path, "rb");
-    if (!fp) {
-        fprintf(stderr, "❌ Failed to open pair file '%s': %s\n", file_path, strerror(errno));
+typedef struct {
+    uint32_t *cache_base;     // Points inside arena (do not free)
+    size_t count;             // Number of cached samples
+    size_t tokens_per_pair;   // True tokens per sample (ctx+1)
+    size_t stride;            // Stride between samples (padded for alignment)
+} PreloadedTrainingData;
+
+static bool shuffle_training_pairs(TrainingPairList *list);
+
+static bool preload_all_training_windows(const TrainingPairList *list,
+                                         TransformerModel *M,
+                                         PreloadedTrainingData *out,
+                                         int num_threads) {
+    if (!list || list->count == 0) {
+        fprintf(stderr, "⚠️ Training pair list is empty, nothing to preload.\n");
         return false;
     }
-    
-    size_t read = fread(buffer, sizeof(uint32_t), total, fp);
-    fclose(fp);
-    
-    if (read != total) {
-        fprintf(stderr, "❌ Expected %zu tokens in '%s' but read %zu\n", total, file_path, read);
+    if (!out) {
+        fprintf(stderr, "⚠️ Internal error: NULL preload output.\n");
         return false;
     }
+    if (M->gradients.training_pair_tokens_offset == 0 ||
+        M->gradients.training_pair_capacity == 0 ||
+        M->gradients.training_pair_tokens_stride == 0 ||
+        M->gradients.training_pair_tokens_count == 0) {
+        fprintf(stderr, "❌ Training buffers not allocated in arena (enable training mode before layout).\n");
+        return false;
+    }
+
+    size_t tokens_per_pair = M->gradients.training_pair_tokens_count;
+    size_t stride = M->gradients.training_pair_tokens_stride;
+    size_t capacity = M->gradients.training_pair_capacity;
+    if (capacity < list->count) {
+        fprintf(stderr, "❌ Training cache capacity (%zu samples) is smaller than dataset (%zu samples).\n",
+                capacity, list->count);
+        fprintf(stderr, "   Increase --train-cache-samples or reduce the dataset before training.\n");
+        return false;
+    }
+
+    uint32_t *cache_base = (uint32_t *)(M->memory_base + M->gradients.training_pair_tokens_offset);
+    out->cache_base = cache_base;
+    out->count = list->count;
+    out->tokens_per_pair = tokens_per_pair;
+    out->stride = stride;
+
+    double start_time = get_time_sec();
+    size_t total_bytes = out->count * stride * sizeof(uint32_t);
+    printf("Preloading %zu training windows (%.2f MB) into arena using %d threads...\n",
+           out->count, total_bytes / (1024.0 * 1024.0), num_threads);
+
+    volatile bool success = true;
+
+    #pragma omp parallel for num_threads(num_threads)
+    for (size_t i = 0; i < list->count; ++i) {
+        if (!success) continue;
+
+        uint32_t *buffer = cache_base + i * stride;
+        FILE *fp = fopen(list->paths[i], "rb");
+        if (!fp) {
+            fprintf(stderr, "❌ Failed to open pair file '%s': %s\n", list->paths[i], strerror(errno));
+            success = false;
+            continue;
+        }
+
+        size_t read_count = fread(buffer, sizeof(uint32_t), tokens_per_pair, fp);
+        fclose(fp);
+
+        if (read_count != tokens_per_pair) {
+            fprintf(stderr, "❌ Expected %zu tokens in '%s' but read %zu\n",
+                    tokens_per_pair, list->paths[i], read_count);
+            success = false;
+            continue;
+        }
+
+        size_t padding = stride - tokens_per_pair;
+        if (padding > 0) {
+            memset(buffer + tokens_per_pair, 0, padding * sizeof(uint32_t));
+        }
+    }
+
+    if (!success) {
+        fprintf(stderr, "❌ Preloading failed. Arena data is undefined.\n");
+        return false;
+    }
+
+    double end_time = get_time_sec();
+    printf("✅ Preloading complete in %.2f seconds.\n", end_time - start_time);
     return true;
 }
 
@@ -6533,23 +6890,31 @@ float training_step(TransformerModel *M,
 
 static void run_training_loop(TransformerModel *M,
                               const char *train_dir,
+                              TrainingPairList *list,
                               int total_steps,
                               float learning_rate,
                               int log_interval,
                               const char *checkpoint_dir,
                               int checkpoint_interval) {
-    TrainingPairList list = {0};
-    if (!build_training_pair_list(train_dir, &list)) {
+    if (!list || list->count == 0) {
+        fprintf(stderr, "❌ Training pair list is empty for %s\n", train_dir ? train_dir : "(unknown)");
         return;
     }
+
+    shuffle_training_pairs(list);
     if (M->gradients.training_pair_tokens_offset == 0) {
         fprintf(stderr, "❌ Training buffers not allocated. Ensure training mode is enabled before layout.\n");
-        free_training_pair_list(&list);
+        return;
+    }
+
+    PreloadedTrainingData preloaded = {0};
+    if (!preload_all_training_windows(list, M, &preloaded, M->num_cores)) {
+        fprintf(stderr, "❌ Failed to preload training data. Aborting.\n");
         return;
     }
     
     if (total_steps <= 0) {
-        total_steps = (int)list.count;
+        total_steps = (int)preloaded.count;
     }
     if (log_interval <= 0) {
         log_interval = 10;
@@ -6557,10 +6922,6 @@ static void run_training_loop(TransformerModel *M,
     if (learning_rate <= 0.0f) {
         learning_rate = 1e-4f;
     }
-    
-    uint32_t *pair_tokens_u32 = (uint32_t *)(M->memory_base + M->gradients.training_pair_tokens_offset);
-    int32_t *input_tokens = (int32_t *)pair_tokens_u32;
-    int32_t *target_tokens = input_tokens + 1;
     
     bool checkpoints_enabled = (checkpoint_dir && checkpoint_dir[0] != '\0');
     if (checkpoints_enabled && !ensure_directory_exists(checkpoint_dir)) {
@@ -6571,18 +6932,19 @@ static void run_training_loop(TransformerModel *M,
     }
     
     size_t pair_index = 0;
-    printf("\n🎯 Starting training loop (%d steps, lr=%.6f) using data at %s\n",
+    const char *last_sample_path = list->paths[0];
+    printf("\n🎯 Starting training loop (%d steps, lr=%.6f) using preloaded data from %s\n",
            total_steps, learning_rate, train_dir);
     
     bool canary_verified_once = false;
     
     for (int step = 0; step < total_steps; ++step) {
-        const char *pair_path = list.paths[pair_index];
-        pair_index = (pair_index + 1) % list.count;
-        
-        if (!load_training_window(pair_path, M->context_window, pair_tokens_u32)) {
-            continue;
-        }
+        size_t current = pair_index;
+        pair_index = (pair_index + 1) % preloaded.count;
+        uint32_t *pair_tokens = preloaded.cache_base + current * preloaded.stride;
+        int32_t *input_tokens = (int32_t *)pair_tokens;
+        int32_t *target_tokens = input_tokens + 1;
+        last_sample_path = list->paths[current];
         
         float loss = training_step(M, input_tokens, target_tokens, learning_rate);
         
@@ -6598,7 +6960,7 @@ static void run_training_loop(TransformerModel *M,
         if ((step + 1) % log_interval == 0 || step == 0) {
             float ppl = expf(loss);
             printf("[train] step=%d/%d  loss=%.6f  perplexity=%.2f  sample=%s\n",
-                   step + 1, total_steps, loss, ppl, pair_path);
+                   step + 1, total_steps, loss, ppl, last_sample_path);
         }
         
         if (checkpoints_enabled && checkpoint_interval > 0 &&
@@ -6621,8 +6983,6 @@ static void run_training_loop(TransformerModel *M,
             fprintf(stderr, "⚠️  Failed to save final checkpoint\n");
         }
     }
-    
-    free_training_pair_list(&list);
 }
 
 void update_all_weights_sgd(TransformerModel *M, float learning_rate);
@@ -6808,8 +7168,21 @@ int main(int argc, char **argv)
     int train_log_interval = 10;
     const char* checkpoint_dir = NULL;
     int checkpoint_interval = 0;
+    size_t train_cache_samples = 0;
     int prompt_tokens[1024];        // Store up to 1024 tokens
     int prompt_length = 0;          // Actual number of tokens
+    TrainingPairList training_pairs = {0};
+    bool training_pairs_ready = false;
+    size_t dataset_pairs = 0;
+
+#define CLEANUP_AND_RETURN(code)                     \
+    do {                                             \
+        if (training_pairs_ready) {                  \
+            free_training_pair_list(&training_pairs);\
+            training_pairs_ready = false;            \
+        }                                            \
+        return (code);                               \
+    } while (0)
 
     static struct option long_opts[] = {
         {"layers", required_argument, 0, 'l'},
@@ -6827,6 +7200,7 @@ int main(int argc, char **argv)
         {"train-log-interval", required_argument, 0, 1003},
         {"ckpt-dir", required_argument, 0, 1004},
         {"ckpt-interval", required_argument, 0, 1005},
+        {"train-cache-samples", required_argument, 0, 1006},
         {0, 0, 0, 0}
     };
 
@@ -6880,9 +7254,24 @@ int main(int argc, char **argv)
         case 1005:
             checkpoint_interval = atoi(optarg);
             break;
+        case 1006:
+            train_cache_samples = strtoull(optarg, NULL, 10);
+            break;
         default:
-            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N]\n", argv[0]);
-            return 1;
+            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N]\n", argv[0]);
+            CLEANUP_AND_RETURN(1);
+        }
+    }
+
+    if (train_dir) {
+        if (!build_training_pair_list(train_dir, &training_pairs)) {
+            CLEANUP_AND_RETURN(1);
+        }
+        training_pairs_ready = true;
+        dataset_pairs = training_pairs.count;
+        if (dataset_pairs == 0) {
+            fprintf(stderr, "❌ No '.bin' training files found in %s\n", train_dir);
+            CLEANUP_AND_RETURN(1);
         }
     }
 
@@ -6893,7 +7282,7 @@ int main(int argc, char **argv)
         // This handles EVERYTHING: read metadata, allocate, load weights
         if (read_model_metadata(&M, weight_file) != 0) {
             fprintf(stderr, "Failed to load GPT-2 model\n");
-            return 1;
+            CLEANUP_AND_RETURN(1);
         }
     } else {
         M.num_layers = L;
@@ -6906,11 +7295,26 @@ int main(int argc, char **argv)
         // ← ADD VALIDATION
     if (C % head_dim != 0) {
         fprintf(stderr, "❌ Error: embed_dim (%d) must be divisible by head_dim (%d)\n", C, head_dim);
-        return 1;
+        CLEANUP_AND_RETURN(1);
     }
 
     if (train_dir) {
         M.training_enabled = true;
+        size_t requested = (train_cache_samples > 0) ? train_cache_samples : dataset_pairs;
+        size_t cache_samples = requested > dataset_pairs ? dataset_pairs : requested;
+        if (cache_samples == 0) {
+            fprintf(stderr, "❌ Training cache size resolved to zero samples.\n");
+            CLEANUP_AND_RETURN(1);
+        }
+        if (train_cache_samples > 0 && cache_samples < dataset_pairs) {
+            printf("⚠️  Training cache limited to %zu/%zu windows (requested %zu)\n",
+                   cache_samples, dataset_pairs, train_cache_samples);
+        }
+        M.training_cache_samples = cache_samples;
+        printf("📚 Training dataset: %zu windows (caching %zu inside arena)\n",
+               dataset_pairs, cache_samples);
+    } else {
+        M.training_cache_samples = 0;
     }
     
     if (!weight_file) {
@@ -6926,14 +7330,14 @@ int main(int argc, char **argv)
     if (!do_alloc)
     {
         printf("Dry-run only (no allocation). Pass --force to allocate and run benchmarks.\n");
-        return 0;
+        CLEANUP_AND_RETURN(0);
     }
 
     // Enforce minimum layers for comprehensive benchmark
     if (run_benchmarks && L < 4)
     {
         fprintf(stderr, "Error: For comprehensive benchmarks, at least --layers 4 is required to demonstrate testing across different kernels on separate layers.\n");
-        return 1;
+        CLEANUP_AND_RETURN(1);
     }
     
     M.num_attention_heads = M.embed_dim / M.head_dim;
@@ -6947,7 +7351,7 @@ int main(int argc, char **argv)
     {
         fprintf(stderr, "❌ Need %.2f GiB but system has only %.2f GiB RAM. Aborting.\n",
                 need_gib, sys_gib);
-        return 1;
+        CLEANUP_AND_RETURN(1);
     }
 
     printf("Allocating huge block... this may page-fault if hugepages are missing\n");
@@ -6996,7 +7400,7 @@ int main(int argc, char **argv)
         printf("📂 Loading weights from: %s\n", weight_file);
         if (load_model_weights(&M, weight_file) != 0) {
             destroy_transformer(&M);
-            return 1;
+            CLEANUP_AND_RETURN(1);
         }
         printf("✅ Weights loaded successfully\n");
     } else {
@@ -7030,10 +7434,32 @@ int main(int argc, char **argv)
     }
 
     if (train_dir) {
-        run_training_loop(&M, train_dir, train_steps, train_learning_rate, train_log_interval,
+        run_training_loop(&M, train_dir, &training_pairs,
+                          train_steps, train_learning_rate, train_log_interval,
                           checkpoint_dir, checkpoint_interval);
+        if (training_pairs_ready) {
+            free_training_pair_list(&training_pairs);
+            training_pairs_ready = false;
+        }
     }
 
     destroy_transformer(&M);
-    return 0;
+    CLEANUP_AND_RETURN(0);
+}
+
+#undef CLEANUP_AND_RETURN
+static bool shuffle_training_pairs(TrainingPairList *list) {
+    if (!list || list->count == 0) {
+        return false;
+    }
+
+    uint32_t seed = (uint32_t)time(NULL);
+    srand(seed);
+    for (size_t i = list->count - 1; i > 0; --i) {
+        size_t j = (size_t)(rand() % (i + 1));
+        char *tmp = list->paths[i];
+        list->paths[i] = list->paths[j];
+        list->paths[j] = tmp;
+    }
+    return true;
 }
