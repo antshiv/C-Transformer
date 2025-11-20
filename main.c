@@ -121,6 +121,11 @@
 /* ─── tiny helpers ────────────────────────────────────────────────── */
 static inline size_t align_up(size_t n, size_t a) { return (n + a - 1) & ~(a - 1); }
 
+typedef enum {
+    TASK_LM = 0,
+    TASK_SEQ_CLS = 1
+} TaskType;
+
 // Enhanced timing function
 static inline double get_time_sec()
 {
@@ -223,6 +228,12 @@ typedef struct {
 
     // Canary protection offset at the end of the layer
     size_t layer_end_canary_offset;
+
+    // KV cache offsets (optional, filled when kv_cache_enabled)
+    size_t k_cache_offset;
+    size_t v_cache_offset;
+
+    // Sequence classification head shares global weights; offsets stored in model
 } TrulyOptimalLayer;
 
 /* ─── Per-Layer Backprop Structure ─────────────────────────────────── */
@@ -359,6 +370,13 @@ typedef struct {
     size_t training_pair_tokens_count;         // Actual tokens stored per sample (context + target)
     size_t training_pair_tokens_stride;        // Padded stride (floats) between samples
     size_t training_pair_capacity;             // Number of samples cached in arena
+
+    size_t seq_cls_logits_offset;              // [num_classes]
+    size_t d_seq_cls_logits_offset;            // [num_classes]
+    size_t seq_cls_pooled_offset;              // [D]
+    size_t d_seq_cls_pooled_offset;            // [D]
+    size_t d_seq_cls_weight_offset;            // [num_classes × D]
+    size_t d_seq_cls_bias_offset;              // [num_classes]
     
     size_t layer_backprop_stride;              // Distance between layers
     
@@ -480,6 +498,22 @@ typedef struct
     bool training_enabled;      ///< Whether gradient storage is allocated
     float learning_rate;        ///< SGD learning rate for weight updates
     size_t training_cache_samples; ///< Number of training windows cached inside arena
+    int active_tokens;          ///< Number of tokens populated in current forward pass
+    TaskType task_type;         ///< Active training/inference task
+
+    /* Sequence Classification Head */
+    bool seq_cls_enabled;
+    int seq_cls_num_classes;
+    int seq_cls_pooling;        ///< 0=final,1=cls,2=mean
+    size_t seq_cls_weight_offset;
+    size_t seq_cls_bias_offset;
+
+    /* ═══════════════════════════════════════════════════════════════════ */
+    /* KV Cache (Inference)                                                 */
+    /* ═══════════════════════════════════════════════════════════════════ */
+    bool kv_cache_enabled;      ///< Whether KV cache regions are allocated/used
+    int kv_cache_capacity;      ///< Maximum tokens stored in cache
+    int kv_cache_tokens;        ///< Number of valid tokens currently cached
 
     /* ═══════════════════════════════════════════════════════════════════ */
     /* Preloaded Training Data (Optimization)                                */
@@ -693,7 +727,7 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
     
     if (M->training_enabled) {
         size_t tokens_per_pair = (size_t)T + 1; // context + next-token target
-        size_t stride_floats = align_up(tokens_per_pair * sizeof(float), CACHE_ALIGN) / sizeof(float);
+        size_t stride_floats = align_up(((size_t)T + 1) * sizeof(float), CACHE_ALIGN) / sizeof(float);
         size_t cache_slots = M->training_cache_samples ? M->training_cache_samples : 1;
         size_t total_tokens = stride_floats * cache_slots;
         M->gradients.training_pair_tokens_offset = bump(&off, total_tokens, CACHE_ALIGN);
@@ -707,6 +741,22 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
         M->gradients.training_pair_capacity = 0;
     }
     // M->gradients.d_embed_weights_offset  <- embed weigths is again used but we have allcoated this pointer above. 
+
+    if (M->seq_cls_enabled) {
+        M->gradients.seq_cls_logits_offset = bump(&off, M->seq_cls_num_classes, CACHE_ALIGN);
+        M->gradients.d_seq_cls_logits_offset = bump(&off, M->seq_cls_num_classes, CACHE_ALIGN);
+        M->gradients.seq_cls_pooled_offset = bump(&off, D, CACHE_ALIGN);
+        M->gradients.d_seq_cls_pooled_offset = bump(&off, D, CACHE_ALIGN);
+        M->gradients.d_seq_cls_weight_offset = bump(&off, (size_t)M->seq_cls_num_classes * D, CACHE_ALIGN);
+        M->gradients.d_seq_cls_bias_offset = bump(&off, M->seq_cls_num_classes, CACHE_ALIGN);
+    } else {
+        M->gradients.seq_cls_logits_offset = 0;
+        M->gradients.d_seq_cls_logits_offset = 0;
+        M->gradients.seq_cls_pooled_offset = 0;
+        M->gradients.d_seq_cls_pooled_offset = 0;
+        M->gradients.d_seq_cls_weight_offset = 0;
+        M->gradients.d_seq_cls_bias_offset = 0;
+    }
     
     // Update total gradient floats
     M->gradients.total_gradient_floats = off - *offset;
@@ -842,6 +892,15 @@ void layout_transformer(TransformerModel *M, bool training_mode) {
 
         // Allocate a canary block at the END of the layer's memory
         L->layer_end_canary_offset = bump(&off, CANARY_SIZE_FLOATS, CACHE_ALIGN);
+
+        if (M->kv_cache_enabled) {
+            size_t kv_slice = (size_t)M->kv_cache_capacity * M->num_attention_heads * aligned_head_dim;
+            L->k_cache_offset = bump(&off, kv_slice, CACHE_ALIGN);
+            L->v_cache_offset = bump(&off, kv_slice, CACHE_ALIGN);
+        } else {
+            L->k_cache_offset = 0;
+            L->v_cache_offset = 0;
+        }
     }
     if (M->num_layers > 1)
     {
@@ -857,6 +916,15 @@ void layout_transformer(TransformerModel *M, bool training_mode) {
     
     M->final_output_offset = bump(&off, (size_t)M->context_window * aligned_embed_dim, CACHE_ALIGN);
     
+    if (M->seq_cls_enabled) {
+        size_t cls_weights = (size_t)M->seq_cls_num_classes * aligned_embed_dim;
+        M->seq_cls_weight_offset = bump(&off, cls_weights, CACHE_ALIGN);
+        M->seq_cls_bias_offset = bump(&off, M->seq_cls_num_classes, CACHE_ALIGN);
+    } else {
+        M->seq_cls_weight_offset = 0;
+        M->seq_cls_bias_offset = 0;
+    }
+
     M->lm_head_weight_offset = M->token_emb_offset;  // WEIGHT TYING
 
     // Then if you're doing language modeling, you might also want:
@@ -899,6 +967,16 @@ static void ensure_model_header_defaults(TransformerModel *M) {
     M->training_data_buffer = NULL;
     M->num_training_tokens = 0;
     M->training_cache_samples = 0;
+    M->active_tokens = 0;
+    M->task_type = TASK_LM;
+    M->seq_cls_enabled = false;
+    M->seq_cls_num_classes = 0;
+    M->seq_cls_pooling = 0;
+    M->seq_cls_weight_offset = 0;
+    M->seq_cls_bias_offset = 0;
+    M->kv_cache_enabled = false;
+    M->kv_cache_capacity = 0;
+    M->kv_cache_tokens = 0;
 }
 
 void destroy_transformer(TransformerModel *M)
@@ -974,6 +1052,15 @@ static unsigned int initialize_model_weights(TransformerModel *M) {
     }
     
     set_tensor_value(M->memory_base + M->final_ln_weight_offset, aligned_dim, 1.0f);
+    if (M->seq_cls_enabled && M->seq_cls_num_classes > 0) {
+        size_t cls_params = (size_t)M->seq_cls_num_classes * aligned_dim;
+        fill_random_tensor(M->memory_base + M->seq_cls_weight_offset,
+                           cls_params,
+                           weight_scale);
+        set_tensor_value(M->memory_base + M->seq_cls_bias_offset,
+                         M->seq_cls_num_classes,
+                         0.0f);
+    }
     return seed;
 }
 
@@ -1049,7 +1136,8 @@ static bool ensure_directory_exists(const char *path) {
 }
 
 // Calculate memory requirements
-static size_t bytes_needed(int layers, int vocab, int d_model, int ctx)
+static size_t bytes_needed(int layers, int vocab, int d_model, int ctx,
+                           bool seq_cls_enabled, int seq_cls_num_classes)
 {
     size_t C = align_up(d_model, CACHE_ALIGN / sizeof(float));
     size_t T = ctx;
@@ -1070,6 +1158,9 @@ static size_t bytes_needed(int layers, int vocab, int d_model, int ctx)
     size_t final_ln_size = 2 * C; // final_ln_weight, final_ln_bias
 
     size_t total_floats = embedding_size + ((size_t)layers * per_layer_floats) + final_ln_size;
+    if (seq_cls_enabled && seq_cls_num_classes > 0) {
+        total_floats += (size_t)seq_cls_num_classes * C + seq_cls_num_classes;
+    }
     return total_floats * sizeof(float);
 }
 
@@ -4032,6 +4123,13 @@ void mlp_token_parallel(TransformerModel *M,
 void embed_tokens(TransformerModel *M, int32_t *token_ids, int num_tokens) {
     // Process tokens up to context window limit
     int tokens_to_process = (num_tokens < M->context_window) ? num_tokens : M->context_window;
+    M->active_tokens = tokens_to_process;
+    if (M->kv_cache_enabled) {
+        if (tokens_to_process > M->kv_cache_capacity) {
+            tokens_to_process = M->kv_cache_capacity;
+        }
+        M->kv_cache_tokens = tokens_to_process;
+    }
     
     for (int t = 0; t < tokens_to_process; t++) {
         int token_id = token_ids[t];
@@ -4066,6 +4164,190 @@ void embed_tokens(TransformerModel *M, int32_t *token_ids, int num_tokens) {
     }
     
     //printf("✅ Embedded %d tokens\n", tokens_to_process);
+}
+
+static inline int effective_token_count(const TransformerModel *M) {
+    if (M->active_tokens > 0 && M->active_tokens <= M->context_window) {
+        return M->active_tokens;
+    }
+    return M->context_window;
+}
+
+static void reset_kv_cache(TransformerModel *M) {
+    if (!M->kv_cache_enabled) {
+        M->kv_cache_tokens = 0;
+        return;
+    }
+    size_t kv_slice = (size_t)M->kv_cache_capacity * M->num_attention_heads * M->aligned_head_dim;
+    size_t kv_bytes = kv_slice * sizeof(float);
+    for (int l = 0; l < M->num_layers; ++l) {
+        TrulyOptimalLayer *layer = &M->layers[l];
+        if (layer->k_cache_offset) {
+            memset(M->memory_base + layer->k_cache_offset, 0, kv_bytes);
+        }
+        if (layer->v_cache_offset) {
+            memset(M->memory_base + layer->v_cache_offset, 0, kv_bytes);
+        }
+    }
+    M->kv_cache_tokens = 0;
+}
+
+static void kv_cache_store_layer(TransformerModel *M, int layer_idx, int tokens) {
+    if (!M->kv_cache_enabled) {
+        return;
+    }
+    TrulyOptimalLayer *layer = &M->layers[layer_idx];
+    if (layer->k_cache_offset == 0 || layer->v_cache_offset == 0) {
+        return;
+    }
+    if (tokens <= 0) tokens = effective_token_count(M);
+    if (tokens > M->kv_cache_capacity) {
+        tokens = M->kv_cache_capacity;
+    }
+    size_t elements = (size_t)tokens * M->num_attention_heads * M->aligned_head_dim;
+    size_t bytes = elements * sizeof(float);
+    memcpy(M->memory_base + layer->k_cache_offset,
+           M->memory_base + layer->k_output_offset,
+           bytes);
+    memcpy(M->memory_base + layer->v_cache_offset,
+           M->memory_base + layer->v_output_offset,
+           bytes);
+    M->kv_cache_tokens = tokens;
+}
+
+static void apply_seq_cls_head(TransformerModel *M, int active_tokens) {
+    if (!M->seq_cls_enabled || M->seq_cls_num_classes <= 0) {
+        return;
+    }
+    if (active_tokens <= 0 || active_tokens > M->context_window) {
+        active_tokens = effective_token_count(M);
+    }
+    float *final_output = M->memory_base + M->final_output_offset;
+    float *pooled = M->memory_base + M->gradients.seq_cls_pooled_offset;
+    int aligned_dim = M->aligned_embed_dim;
+    int embed_dim = M->embed_dim;
+    memset(pooled, 0, aligned_dim * sizeof(float));
+
+    if (M->seq_cls_pooling == 2) { // mean
+        for (int t = 0; t < active_tokens; ++t) {
+            const float *token_vec = final_output + t * aligned_dim;
+            for (int d = 0; d < embed_dim; ++d) {
+                pooled[d] += token_vec[d];
+            }
+        }
+        if (active_tokens > 0) {
+            float scale = 1.0f / (float)active_tokens;
+            for (int d = 0; d < embed_dim; ++d) {
+                pooled[d] *= scale;
+            }
+        }
+    } else {
+        int idx = (M->seq_cls_pooling == 1) ? 0 : (active_tokens > 0 ? active_tokens - 1 : 0);
+        if (idx < 0) idx = 0;
+        if (idx >= M->context_window) idx = M->context_window - 1;
+        const float *token_vec = final_output + idx * aligned_dim;
+        memcpy(pooled, token_vec, embed_dim * sizeof(float));
+    }
+
+    float *logits = M->memory_base + M->gradients.seq_cls_logits_offset;
+    const float *weights = M->memory_base + M->seq_cls_weight_offset;
+    const float *bias = M->memory_base + M->seq_cls_bias_offset;
+    for (int c = 0; c < M->seq_cls_num_classes; ++c) {
+        const float *w_row = weights + (size_t)c * aligned_dim;
+        float sum = bias[c];
+        for (int d = 0; d < embed_dim; ++d) {
+            sum += w_row[d] * pooled[d];
+        }
+        logits[c] = sum;
+    }
+}
+
+static float compute_seq_cls_loss(TransformerModel *M, int32_t label) {
+    if (!M->seq_cls_enabled || M->seq_cls_num_classes <= 0) {
+        return 0.0f;
+    }
+    float *logits = M->memory_base + M->gradients.seq_cls_logits_offset;
+    float *d_logits = M->memory_base + M->gradients.d_seq_cls_logits_offset;
+    int num_classes = M->seq_cls_num_classes;
+    if (label < 0 || label >= num_classes) {
+        label = (label % num_classes + num_classes) % num_classes;
+    }
+
+    float max_logit = logits[0];
+    for (int c = 1; c < num_classes; ++c) {
+        if (logits[c] > max_logit) {
+            max_logit = logits[c];
+        }
+    }
+    double sum_exp = 0.0;
+    for (int c = 0; c < num_classes; ++c) {
+        d_logits[c] = expf(logits[c] - max_logit);
+        sum_exp += d_logits[c];
+    }
+    float inv_sum = (float)(1.0 / (sum_exp + 1e-9));
+    float loss = 0.0f;
+    for (int c = 0; c < num_classes; ++c) {
+        float prob = d_logits[c] * inv_sum;
+        d_logits[c] = prob;
+        if (c == label) {
+            loss = -logf(prob + 1e-9f);
+        }
+    }
+    d_logits[label] -= 1.0f;
+    return loss;
+}
+
+static void backward_seq_cls_head(TransformerModel *M, int active_tokens) {
+    if (!M->seq_cls_enabled || M->seq_cls_num_classes <= 0) {
+        return;
+    }
+    if (active_tokens <= 0 || active_tokens > M->context_window) {
+        active_tokens = effective_token_count(M);
+    }
+    float *d_logits = M->memory_base + M->gradients.d_seq_cls_logits_offset;
+    float *pooled = M->memory_base + M->gradients.seq_cls_pooled_offset;
+    float *d_pooled = M->memory_base + M->gradients.d_seq_cls_pooled_offset;
+    float *weights = M->memory_base + M->seq_cls_weight_offset;
+    float *d_weights = M->memory_base + M->gradients.d_seq_cls_weight_offset;
+    float *d_bias = M->memory_base + M->gradients.d_seq_cls_bias_offset;
+    float *d_final = M->memory_base + M->gradients.d_final_output_offset;
+
+    int num_classes = M->seq_cls_num_classes;
+    int aligned_dim = M->aligned_embed_dim;
+    int embed_dim = M->embed_dim;
+    memset(d_pooled, 0, aligned_dim * sizeof(float));
+
+    for (int c = 0; c < num_classes; ++c) {
+        float grad = d_logits[c];
+        d_bias[c] += grad;
+        float *w_row = weights + (size_t)c * aligned_dim;
+        float *dw_row = d_weights + (size_t)c * aligned_dim;
+        for (int d = 0; d < embed_dim; ++d) {
+            dw_row[d] += grad * pooled[d];
+            d_pooled[d] += grad * w_row[d];
+        }
+    }
+
+    if (active_tokens <= 0) {
+        active_tokens = 1;
+    }
+    if (M->seq_cls_pooling == 2) { // mean pooling
+        float scale = 1.0f / (float)active_tokens;
+        for (int t = 0; t < active_tokens; ++t) {
+            float *dest = d_final + t * aligned_dim;
+            for (int d = 0; d < embed_dim; ++d) {
+                dest[d] += d_pooled[d] * scale;
+            }
+        }
+    } else {
+        int idx = (M->seq_cls_pooling == 1) ? 0 : (active_tokens > 0 ? active_tokens - 1 : 0);
+        if (idx < 0) idx = 0;
+        if (idx >= M->context_window) idx = M->context_window - 1;
+        float *dest = d_final + idx * aligned_dim;
+        for (int d = 0; d < embed_dim; ++d) {
+            dest[d] += d_pooled[d];
+        }
+    }
 }
 
 void compute_logits_last_token_optimized(TransformerModel *M, int position) {
@@ -4114,6 +4396,7 @@ void transformer_layer_forward(TransformerModel *M, int layer_idx, size_t layer_
 
     // 2. QKV Projection
     qkv_projection_head_major(M, layer_idx);
+    kv_cache_store_layer(M, layer_idx, M->kv_cache_tokens);
 
     // 3. Attention Computation
     attention_head_major_complete(M, layer_idx);
@@ -4715,6 +4998,13 @@ int sample_token(float* logits, int vocab_size, float temperature) {
 
 void generate(TransformerModel* M, int* prompt, int prompt_len, int max_tokens) {
     printf("🎲 Starting generation\n");
+    if (M->task_type != TASK_LM) {
+        fprintf(stderr, "❌ Generation currently supported only in LM mode.\n");
+        return;
+    }
+    if (M->kv_cache_enabled) {
+        reset_kv_cache(M);
+    }
     
     // OPTION 1: Use stack allocation for token IDs
     int32_t context[1024];  // Safe, separate from model memory
@@ -6652,6 +6942,7 @@ void backward_transformer_layer(TransformerModel *M, int layer_idx) {
  */
 void compute_cross_entropy_loss(TransformerModel *M, 
                                 int32_t *target_tokens,
+                                int active_tokens,
                                 float *loss_out) {
     
     float *logits = M->memory_base + M->logits_offset;
@@ -6660,7 +6951,7 @@ void compute_cross_entropy_loss(TransformerModel *M,
     double total_loss = 0.0;  // Use double for accumulation precision
     
     #pragma omp parallel for reduction(+:total_loss)
-    for (int t = 0; t < M->context_window; t++) {
+    for (int t = 0; t < active_tokens; t++) {
         float *token_logits = logits + t * M->vocab_size;
         float *token_d_logits = d_logits + t * M->vocab_size;
         int correct_token = target_tokens[t];
@@ -6693,13 +6984,13 @@ void compute_cross_entropy_loss(TransformerModel *M,
         token_d_logits[correct_token] -= 1.0f;
         
         // Scale by 1/context_length for average
-        float scale = 1.0f / M->context_window;
+        float scale = 1.0f / active_tokens;
         for (int v = 0; v < M->vocab_size; v++) {
             token_d_logits[v] *= scale;
         }
     }
     
-    *loss_out = total_loss / M->context_window;
+    *loss_out = total_loss / active_tokens;
 }
 
 typedef struct {
@@ -6791,8 +7082,10 @@ static bool build_training_pair_list(const char *dir_path, TrainingPairList *out
 typedef struct {
     uint32_t *cache_base;     // Points inside arena (do not free)
     size_t count;             // Number of cached samples
-    size_t tokens_per_pair;   // True tokens per sample (ctx+1)
+    size_t tokens_per_pair;   // Legacy fixed-size (ctx+1)
     size_t stride;            // Stride between samples (padded for alignment)
+    uint16_t *ctx_lengths;    // ctx_len per sample
+    uint16_t *target_lengths; // target_len per sample
 } PreloadedTrainingData;
 
 static bool shuffle_training_pairs(TrainingPairList *list);
@@ -6832,6 +7125,16 @@ static bool preload_all_training_windows(const TrainingPairList *list,
     out->count = list->count;
     out->tokens_per_pair = tokens_per_pair;
     out->stride = stride;
+    out->ctx_lengths = (uint16_t *)calloc(list->count, sizeof(uint16_t));
+    out->target_lengths = (uint16_t *)calloc(list->count, sizeof(uint16_t));
+    if (!out->ctx_lengths || !out->target_lengths) {
+        fprintf(stderr, "❌ Failed to allocate metadata arrays for training cache.\n");
+        free(out->ctx_lengths);
+        free(out->target_lengths);
+        out->ctx_lengths = NULL;
+        out->target_lengths = NULL;
+        return false;
+    }
 
     double start_time = get_time_sec();
     size_t total_bytes = out->count * stride * sizeof(uint32_t);
@@ -6852,24 +7155,105 @@ static bool preload_all_training_windows(const TrainingPairList *list,
             continue;
         }
 
-        size_t read_count = fread(buffer, sizeof(uint32_t), tokens_per_pair, fp);
-        fclose(fp);
-
-        if (read_count != tokens_per_pair) {
-            fprintf(stderr, "❌ Expected %zu tokens in '%s' but read %zu\n",
-                    tokens_per_pair, list->paths[i], read_count);
+        if (fseek(fp, 0, SEEK_END) != 0) {
+            fprintf(stderr, "❌ Failed to seek file '%s'\n", list->paths[i]);
+            fclose(fp);
             success = false;
             continue;
         }
-
-        size_t padding = stride - tokens_per_pair;
-        if (padding > 0) {
-            memset(buffer + tokens_per_pair, 0, padding * sizeof(uint32_t));
+        long file_size = ftell(fp);
+        if (file_size < 0) {
+            fprintf(stderr, "❌ Failed to determine size of '%s'\n", list->paths[i]);
+            fclose(fp);
+            success = false;
+            continue;
         }
+        rewind(fp);
+
+        size_t expected_legacy_bytes = tokens_per_pair * sizeof(uint32_t);
+        uint16_t ctx_len = 0;
+        uint16_t tgt_len = 0;
+        if ((size_t)file_size == expected_legacy_bytes) {
+            ctx_len = (uint16_t)M->context_window;
+            tgt_len = 1;
+            size_t read_count = fread(buffer, sizeof(uint32_t), tokens_per_pair, fp);
+            fclose(fp);
+            if (read_count != tokens_per_pair) {
+                fprintf(stderr, "❌ Legacy read mismatch in '%s'\n", list->paths[i]);
+                success = false;
+                continue;
+            }
+            size_t padding = stride - tokens_per_pair;
+            if (padding > 0) {
+                memset(buffer + tokens_per_pair, 0, padding * sizeof(uint32_t));
+            }
+        } else {
+            if ((size_t)file_size < sizeof(uint16_t) * 2) {
+                fprintf(stderr, "❌ File '%s' too small for metadata header\n", list->paths[i]);
+                fclose(fp);
+                success = false;
+                continue;
+            }
+            size_t header_read = fread(&ctx_len, sizeof(uint16_t), 1, fp);
+            if (header_read != 1) {
+                fprintf(stderr, "❌ Failed to read ctx_len from '%s'\n", list->paths[i]);
+                fclose(fp);
+                success = false;
+                continue;
+            }
+            size_t target_read = fread(&tgt_len, sizeof(uint16_t), 1, fp);
+            if (target_read != 1) {
+                tgt_len = 1;
+            }
+            if (ctx_len == 0 || ctx_len > M->context_window) {
+                fprintf(stderr, "❌ Invalid ctx_len=%u in '%s' (max %d)\n",
+                        ctx_len, list->paths[i], M->context_window);
+                fclose(fp);
+                success = false;
+                continue;
+            }
+            if (tgt_len == 0) {
+                tgt_len = 1;
+            }
+            size_t total_tokens = (size_t)ctx_len + tgt_len;
+            size_t expected_bytes = sizeof(uint16_t) * 2 + total_tokens * sizeof(uint32_t);
+            if ((size_t)file_size < expected_bytes) {
+                fprintf(stderr, "❌ File '%s' truncated (expected ≥%zu bytes, got %ld)\n",
+                        list->paths[i], expected_bytes, file_size);
+                fclose(fp);
+                success = false;
+                continue;
+            }
+            if (total_tokens > stride) {
+                fprintf(stderr, "❌ ctx_len + target_len exceeds stride in '%s'\n", list->paths[i]);
+                fclose(fp);
+                success = false;
+                continue;
+            }
+            size_t read_count = fread(buffer, sizeof(uint32_t), total_tokens, fp);
+            fclose(fp);
+            if (read_count != total_tokens) {
+                fprintf(stderr, "❌ Expected %zu tokens in '%s' but read %zu\n",
+                        total_tokens, list->paths[i], read_count);
+                success = false;
+                continue;
+            }
+            size_t padding = stride - total_tokens;
+            if (padding > 0) {
+                memset(buffer + total_tokens, 0, padding * sizeof(uint32_t));
+            }
+        }
+
+        out->ctx_lengths[i] = ctx_len;
+        out->target_lengths[i] = tgt_len;
     }
 
     if (!success) {
         fprintf(stderr, "❌ Preloading failed. Arena data is undefined.\n");
+        free(out->ctx_lengths);
+        free(out->target_lengths);
+        out->ctx_lengths = NULL;
+        out->target_lengths = NULL;
         return false;
     }
 
@@ -6881,6 +7265,8 @@ static bool preload_all_training_windows(const TrainingPairList *list,
 float training_step(TransformerModel *M, 
                     int32_t *input_tokens,
                     int32_t *target_tokens,
+                    int32_t seq_label,
+                    int ctx_len,
                     float learning_rate);
 
 static void run_training_loop(TransformerModel *M,
@@ -6940,10 +7326,15 @@ static void run_training_loop(TransformerModel *M,
         pair_index = (pair_index + 1) % preloaded.count;
         uint32_t *pair_tokens = preloaded.cache_base + current * preloaded.stride;
         int32_t *input_tokens = (int32_t *)pair_tokens;
+        uint16_t ctx_len = preloaded.ctx_lengths ? preloaded.ctx_lengths[current] : (uint16_t)M->context_window;
+        if (ctx_len == 0 || ctx_len > M->context_window) {
+            ctx_len = (uint16_t)M->context_window;
+        }
         int32_t *target_tokens = input_tokens + 1;
+        int32_t seq_label = 0;
         last_sample_path = list->paths[current];
         
-        float loss = training_step(M, input_tokens, target_tokens, learning_rate);
+        float loss = training_step(M, input_tokens, target_tokens, seq_label, ctx_len, learning_rate);
         
         if (!canary_verified_once) {
             if (!verify_canaries(M, "first training step")) {
@@ -6959,10 +7350,16 @@ static void run_training_loop(TransformerModel *M,
             double window = now - last_log_time;
             double total_elapsed = now - training_start;
             double steps_per_sec = (total_elapsed > 0.0) ? ((double)(step + 1) / total_elapsed) : 0.0;
-            float ppl = expf(loss);
-            printf("[train] step=%d/%d  loss=%.6f  perplexity=%.2f  sample=%s  Δt=%.2fs  total=%.2fs  steps/s=%.2f\n",
-                   step + 1, total_steps, loss, ppl, last_sample_path,
-                   window, total_elapsed, steps_per_sec);
+            if (M->task_type == TASK_LM) {
+                float ppl = expf(loss);
+                printf("[train] step=%d/%d  loss=%.6f  perplexity=%.2f  sample=%s  Δt=%.2fs  total=%.2fs  steps/s=%.2f\n",
+                       step + 1, total_steps, loss, ppl, last_sample_path,
+                       window, total_elapsed, steps_per_sec);
+            } else {
+                printf("[train] step=%d/%d  loss=%.6f  sample=%s  Δt=%.2fs  total=%.2fs  steps/s=%.2f\n",
+                       step + 1, total_steps, loss, last_sample_path,
+                       window, total_elapsed, steps_per_sec);
+            }
             last_log_time = now;
         }
         
@@ -6988,6 +7385,15 @@ static void run_training_loop(TransformerModel *M,
             fprintf(stderr, "⚠️  Failed to save final checkpoint\n");
         }
     }
+
+    if (preloaded.ctx_lengths) {
+        free(preloaded.ctx_lengths);
+        preloaded.ctx_lengths = NULL;
+    }
+    if (preloaded.target_lengths) {
+        free(preloaded.target_lengths);
+        preloaded.target_lengths = NULL;
+    }
 }
 
 void update_all_weights_sgd(TransformerModel *M, float learning_rate);
@@ -6995,14 +7401,26 @@ void update_all_weights_sgd(TransformerModel *M, float learning_rate);
 float training_step(TransformerModel *M, 
                     int32_t *input_tokens,
                     int32_t *target_tokens,
+                    int32_t seq_label,
+                    int ctx_len,
                     float learning_rate) {
     
-    // Store input tokens for backward pass
-    memcpy(M->memory_base + M->gradients.actual_tokens_offset, 
-           input_tokens, M->context_window * sizeof(int32_t));
+    if (ctx_len <= 0 || ctx_len > M->context_window) {
+        ctx_len = M->context_window;
+    }
+    
+    // Store input tokens for backward pass (pad remainder with zeros)
+    int32_t *token_cache = (int32_t *)(M->memory_base + M->gradients.actual_tokens_offset);
+    memcpy(token_cache, input_tokens, ctx_len * sizeof(int32_t));
+    if (ctx_len < M->context_window) {
+        memset(token_cache + ctx_len, 0, (M->context_window - ctx_len) * sizeof(int32_t));
+    }
+    
+    bool lm_task = (M->task_type == TASK_LM);
+    bool seq_task = (M->task_type == TASK_SEQ_CLS) && M->seq_cls_enabled;
     
     // ======== FORWARD PASS ========
-    embed_tokens(M, input_tokens, M->context_window);
+    embed_tokens(M, input_tokens, ctx_len);
     
     size_t current_input = M->embedded_input_offset;
     for (int layer = 0; layer < M->num_layers; layer++) {
@@ -7017,21 +7435,36 @@ float training_step(TransformerModel *M,
                             M->final_ln_rstd_offset,
                             M->final_output_offset, 1e-5f);
     
-    // Compute logits for all positions
-    #pragma omp parallel for num_threads(M->num_cores)
-    for (int t = 0; t < M->context_window; t++) {
-        compute_logits_last_token_optimized(M, t);
+    float total_loss = 0.0f;
+    int active_tokens = ctx_len;
+    M->active_tokens = ctx_len;
+    
+    if (lm_task) {
+        #pragma omp parallel for num_threads(M->num_cores)
+        for (int t = 0; t < ctx_len; t++) {
+            compute_logits_last_token_optimized(M, t);
+        }
+        float lm_loss;
+        compute_cross_entropy_loss(M, target_tokens, ctx_len, &lm_loss);
+        total_loss += lm_loss;
+    }
+    
+    if (seq_task) {
+        apply_seq_cls_head(M, active_tokens);
+        float cls_loss = compute_seq_cls_loss(M, seq_label);
+        total_loss += cls_loss;
     }
     
     // ======== BACKWARD PASS ========
     zero_gradients(M);
     cache_forward_activations(M);
     
-    float loss;
-    compute_cross_entropy_loss(M, target_tokens, &loss);
-    
-    // Backward from logits (includes token embedding gradient via weight tying)
-    backward_lm_head(M);
+    if (lm_task) {
+        backward_lm_head(M);
+    }
+    if (seq_task) {
+        backward_seq_cls_head(M, active_tokens);
+    }
     
     // Backward through final layernorm
     backward_final_layernorm(M);
@@ -7047,7 +7480,7 @@ float training_step(TransformerModel *M,
     // ======== WEIGHT UPDATE ========
     update_all_weights_sgd(M, learning_rate);
 
-    return loss;
+    return total_loss;
 }
 
 void update_all_weights_sgd(TransformerModel *M, float learning_rate) {
@@ -7153,6 +7586,20 @@ void update_all_weights_sgd(TransformerModel *M, float learning_rate) {
         M->memory_base[M->final_ln_bias_offset + i] -=
             learning_rate * M->memory_base[M->gradients.d_final_ln_beta_offset + i];
     }
+
+    if (M->seq_cls_enabled && M->seq_cls_num_classes > 0) {
+        size_t cls_count = (size_t)M->seq_cls_num_classes * aligned_dim;
+        float *cls_weights = M->memory_base + M->seq_cls_weight_offset;
+        float *d_cls_weights = M->memory_base + M->gradients.d_seq_cls_weight_offset;
+        for (size_t i = 0; i < cls_count; ++i) {
+            cls_weights[i] -= learning_rate * d_cls_weights[i];
+        }
+        float *cls_bias = M->memory_base + M->seq_cls_bias_offset;
+        float *d_cls_bias = M->memory_base + M->gradients.d_seq_cls_bias_offset;
+        for (int i = 0; i < M->seq_cls_num_classes; ++i) {
+            cls_bias[i] -= learning_rate * d_cls_bias[i];
+        }
+    }
 }
 
 /**************************************************************/
@@ -7179,6 +7626,8 @@ int main(int argc, char **argv)
     TrainingPairList training_pairs = {0};
     bool training_pairs_ready = false;
     size_t dataset_pairs = 0;
+    int seq_cls_num_classes = 0;
+    const char *seq_cls_pooling_str = "final";
 
 #define CLEANUP_AND_RETURN(code)                     \
     do {                                             \
@@ -7206,6 +7655,8 @@ int main(int argc, char **argv)
         {"ckpt-dir", required_argument, 0, 1004},
         {"ckpt-interval", required_argument, 0, 1005},
         {"train-cache-samples", required_argument, 0, 1006},
+        {"seq-cls-classes", required_argument, 0, 1007},
+        {"seq-cls-pooling", required_argument, 0, 1008},
         {0, 0, 0, 0}
     };
 
@@ -7262,8 +7713,14 @@ int main(int argc, char **argv)
         case 1006:
             train_cache_samples = strtoull(optarg, NULL, 10);
             break;
+        case 1007:
+            seq_cls_num_classes = atoi(optarg);
+            break;
+        case 1008:
+            seq_cls_pooling_str = optarg;
+            break;
         default:
-            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean]\n", argv[0]);
             CLEANUP_AND_RETURN(1);
         }
     }
@@ -7280,8 +7737,39 @@ int main(int argc, char **argv)
         }
     }
 
+    bool seq_cls_cli_enabled = false;
+    int seq_cls_pooling_mode = 0;
+    if (seq_cls_num_classes > 0) {
+        seq_cls_cli_enabled = true;
+        if (strcmp(seq_cls_pooling_str, "final") == 0) {
+            seq_cls_pooling_mode = 0;
+        } else if (strcmp(seq_cls_pooling_str, "cls") == 0) {
+            seq_cls_pooling_mode = 1;
+        } else if (strcmp(seq_cls_pooling_str, "mean") == 0) {
+            seq_cls_pooling_mode = 2;
+        } else {
+            fprintf(stderr, "❌ Unknown seq-cls-pooling mode '%s' (use final|cls|mean)\n", seq_cls_pooling_str);
+            CLEANUP_AND_RETURN(1);
+        }
+    }
+
+
     /* ---------- try allocation ---------- */
     TransformerModel M = {0};
+    
+    if (seq_cls_cli_enabled) {
+        M.seq_cls_enabled = true;
+        M.seq_cls_num_classes = seq_cls_num_classes;
+        M.seq_cls_pooling = seq_cls_pooling_mode;
+        M.task_type = TASK_SEQ_CLS;
+        printf("🧾 Sequence classification head enabled (%d classes, pooling=%s)\n",
+               M.seq_cls_num_classes, seq_cls_pooling_str);
+    } else {
+        M.seq_cls_enabled = false;
+        M.seq_cls_num_classes = 0;
+        M.seq_cls_pooling = 0;
+        M.task_type = TASK_LM;
+    }
     
     if (weight_file) {
         // This handles EVERYTHING: read metadata, allocate, load weights
@@ -7318,15 +7806,21 @@ int main(int argc, char **argv)
         M.training_cache_samples = cache_samples;
         printf("📚 Training dataset: %zu windows (caching %zu inside arena)\n",
                dataset_pairs, cache_samples);
+        M.kv_cache_enabled = false;
     } else {
         M.training_cache_samples = 0;
+        M.kv_cache_enabled = true;
+    }
+    if (M.kv_cache_capacity <= 0) {
+        M.kv_cache_capacity = M.context_window;
     }
     
     if (!weight_file) {
         ensure_model_header_defaults(&M);
     }
 
-    size_t need_bytes = bytes_needed(M.num_layers, M.vocab_size, M.embed_dim, M.context_window);
+    size_t need_bytes = bytes_needed(M.num_layers, M.vocab_size, M.embed_dim, M.context_window,
+                                     M.seq_cls_enabled, M.seq_cls_num_classes);
     double need_gib = need_bytes / (1024.0 * 1024.0 * 1024.0);
 
     printf("⚙  Requested model  L=%d  d_model=%d  ctx=%d  vocab=%d\n", M.num_layers, M.embed_dim, M.context_window, M.vocab_size);
@@ -7408,6 +7902,14 @@ int main(int argc, char **argv)
             CLEANUP_AND_RETURN(1);
         }
         printf("✅ Weights loaded successfully\n");
+        if (M.seq_cls_enabled && M.seq_cls_weight_offset != 0) {
+            float *cls_w = M.memory_base + M.seq_cls_weight_offset;
+            size_t cls_params = (size_t)M.seq_cls_num_classes * M.aligned_embed_dim;
+            fill_random_tensor(cls_w, cls_params, 0.02f);
+            set_tensor_value(M.memory_base + M.seq_cls_bias_offset,
+                             M.seq_cls_num_classes,
+                             0.0f);
+        }
     } else {
         unsigned int seed_used = initialize_model_weights(&M);
         float *emb_weights = M.memory_base + M.token_emb_offset;
@@ -7419,6 +7921,10 @@ int main(int argc, char **argv)
                seed_used, sqrtf(accum));
     }
     initialize_canaries(&M);
+    if (M.kv_cache_enabled) {
+        reset_kv_cache(&M);
+        printf("💾 KV cache enabled (capacity=%d tokens per layer)\n", M.kv_cache_capacity);
+    }
 
     if (weight_file && !train_dir) {
         printf("\n🚀 Generating text...\n");
