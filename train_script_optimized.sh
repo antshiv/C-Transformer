@@ -8,12 +8,23 @@ CTX=${CTX:-1024}
 VOCAB=${VOCAB:-50257}
 TRAIN_DIR=${TRAIN_DIR:-data/training_pairs}
 TRAIN_STEPS=${TRAIN_STEPS:-500}
-TRAIN_LR=${TRAIN_LR:-1e-4}
+TRAIN_LR=${TRAIN_LR:-3e-4}
 TRAIN_LOG_INTERVAL=${TRAIN_LOG_INTERVAL:-10}
 WEIGHTS=${WEIGHTS:-gpt2_bump.weights}
 CHECKPOINT_DIR=${CHECKPOINT_DIR:-checkpoints_opt}
 CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL:-50}
 TRAIN_CACHE_SAMPLES=${TRAIN_CACHE_SAMPLES:-}
+
+# Optimizer and training safety knobs (override via env if needed)
+OPTIMIZER=${OPTIMIZER:-adam}
+ADAM_BETA1=${ADAM_BETA1:-0.9}
+ADAM_BETA2=${ADAM_BETA2:-0.999}
+ADAM_EPS=${ADAM_EPS:-1e-8}
+WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
+EMA_DECAY=${EMA_DECAY:-0.0}
+LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-200}
+LR_WARMUP_INIT=${LR_WARMUP_INIT:-0.0}
+GRAD_CLIP=${GRAD_CLIP:-1.0}
 
 # Extra compiler knobs (override via environment if needed)
 OPT_FLAGS=${OPT_FLAGS:-"-O3 -march=native -mavx512f -fopenmp"}
@@ -52,6 +63,15 @@ CMD=(./main_opt
   --train-log-interval "${TRAIN_LOG_INTERVAL}"
   --ckpt-dir "${CHECKPOINT_DIR}"
   --ckpt-interval "${CHECKPOINT_INTERVAL}"
+  --optimizer "${OPTIMIZER}"
+  --adam-beta1 "${ADAM_BETA1}"
+  --adam-beta2 "${ADAM_BETA2}"
+  --adam-eps "${ADAM_EPS}"
+  --weight-decay "${WEIGHT_DECAY}"
+  --ema-decay "${EMA_DECAY}"
+  --lr-warmup-steps "${LR_WARMUP_STEPS}"
+  --lr-warmup-init "${LR_WARMUP_INIT}"
+  --grad-clip "${GRAD_CLIP}"
 )
 
 if [ -n "${TRAIN_CACHE_SAMPLES}" ]; then

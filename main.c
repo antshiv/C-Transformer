@@ -126,6 +126,11 @@ typedef enum {
     TASK_SEQ_CLS = 1
 } TaskType;
 
+typedef enum {
+    OPTIMIZER_SGD = 0,
+    OPTIMIZER_ADAM = 1,
+} OptimizerType;
+
 // Enhanced timing function
 static inline double get_time_sec()
 {
@@ -333,6 +338,56 @@ typedef struct {
     size_t d_ln1_input_offset;                 // [T × D] flows to previous layer
     size_t d_ln1_gamma_offset;                 // [D] accumulator
     size_t d_ln1_beta_offset;                  // [D] accumulator
+
+    /* ===== OPTIMIZER STATE (ADAM / EMA) ===== */
+    size_t ln1_gamma_m_offset;
+    size_t ln1_gamma_v_offset;
+    size_t ln1_gamma_ema_offset;
+    size_t ln1_beta_m_offset;
+    size_t ln1_beta_v_offset;
+    size_t ln1_beta_ema_offset;
+    size_t q_weight_m_offset;
+    size_t q_weight_v_offset;
+    size_t q_weight_ema_offset;
+    size_t q_bias_m_offset;
+    size_t q_bias_v_offset;
+    size_t q_bias_ema_offset;
+    size_t k_weight_m_offset;
+    size_t k_weight_v_offset;
+    size_t k_weight_ema_offset;
+    size_t k_bias_m_offset;
+    size_t k_bias_v_offset;
+    size_t k_bias_ema_offset;
+    size_t v_weight_m_offset;
+    size_t v_weight_v_offset;
+    size_t v_weight_ema_offset;
+    size_t v_bias_m_offset;
+    size_t v_bias_v_offset;
+    size_t v_bias_ema_offset;
+    size_t proj_weight_m_offset;
+    size_t proj_weight_v_offset;
+    size_t proj_weight_ema_offset;
+    size_t proj_bias_m_offset;
+    size_t proj_bias_v_offset;
+    size_t proj_bias_ema_offset;
+    size_t ln2_gamma_m_offset;
+    size_t ln2_gamma_v_offset;
+    size_t ln2_gamma_ema_offset;
+    size_t ln2_beta_m_offset;
+    size_t ln2_beta_v_offset;
+    size_t ln2_beta_ema_offset;
+    size_t fc1_weight_m_offset;
+    size_t fc1_weight_v_offset;
+    size_t fc1_weight_ema_offset;
+    size_t fc1_bias_m_offset;
+    size_t fc1_bias_v_offset;
+    size_t fc1_bias_ema_offset;
+    size_t fc2_weight_m_offset;
+    size_t fc2_weight_v_offset;
+    size_t fc2_weight_ema_offset;
+    size_t fc2_bias_m_offset;
+    size_t fc2_bias_v_offset;
+    size_t fc2_bias_ema_offset;
     
 } LayerGradients;
 
@@ -370,6 +425,26 @@ typedef struct {
     size_t training_pair_tokens_count;         // Actual tokens stored per sample (context + target)
     size_t training_pair_tokens_stride;        // Padded stride (floats) between samples
     size_t training_pair_capacity;             // Number of samples cached in arena
+
+    /* Optimizer state for global parameters */
+    size_t token_emb_m_offset;
+    size_t token_emb_v_offset;
+    size_t token_emb_ema_offset;
+    size_t pos_emb_m_offset;
+    size_t pos_emb_v_offset;
+    size_t pos_emb_ema_offset;
+    size_t final_ln_gamma_m_offset;
+    size_t final_ln_gamma_v_offset;
+    size_t final_ln_gamma_ema_offset;
+    size_t final_ln_beta_m_offset;
+    size_t final_ln_beta_v_offset;
+    size_t final_ln_beta_ema_offset;
+    size_t seq_cls_weight_m_offset;
+    size_t seq_cls_weight_v_offset;
+    size_t seq_cls_weight_ema_offset;
+    size_t seq_cls_bias_m_offset;
+    size_t seq_cls_bias_v_offset;
+    size_t seq_cls_bias_ema_offset;
 
     size_t seq_cls_logits_offset;              // [num_classes]
     size_t d_seq_cls_logits_offset;            // [num_classes]
@@ -497,9 +572,21 @@ typedef struct
     GradientStorage gradients;  ///< Gradient and activation cache memory (training only)
     bool training_enabled;      ///< Whether gradient storage is allocated
     float learning_rate;        ///< SGD learning rate for weight updates
+    int lr_warmup_steps;        ///< Number of steps to linearly warm up the LR
+    float lr_warmup_init;       ///< Starting LR for warmup (defaults to 0 when unset)
+    float grad_clip;            ///< Clip gradients to +/- this value (0 disables)
     size_t training_cache_samples; ///< Number of training windows cached inside arena
     int active_tokens;          ///< Number of tokens populated in current forward pass
     TaskType task_type;         ///< Active training/inference task
+    OptimizerType optimizer;   ///< Selected optimizer
+    uint64_t optimizer_step;   ///< Number of optimization steps taken
+    float adam_beta1;
+    float adam_beta2;
+    float adam_eps;
+    float weight_decay;
+    bool ema_enabled;
+    float ema_decay;
+    bool optimizer_state_initialized;
 
     /* Sequence Classification Head */
     bool seq_cls_enabled;
@@ -572,6 +659,30 @@ static inline size_t bump(size_t *off, size_t count, size_t alignB) {
     return here;
 }
 
+static inline void allocate_optimizer_buffers(TransformerModel *M,
+                                              size_t *off,
+                                              size_t count,
+                                              size_t *m_offset,
+                                              size_t *v_offset,
+                                              size_t *ema_offset) {
+    bool need_moments = (M->optimizer == OPTIMIZER_ADAM);
+    bool need_ema = M->ema_enabled;
+
+    if (need_moments) {
+        *m_offset = bump(off, count, CACHE_ALIGN);
+        *v_offset = bump(off, count, CACHE_ALIGN);
+    } else {
+        *m_offset = 0;
+        *v_offset = 0;
+    }
+
+    if (need_ema) {
+        *ema_offset = bump(off, count, CACHE_ALIGN);
+    } else {
+        *ema_offset = 0;
+    }
+}
+
 
  /**
  * @brief Lays out the memory for the backward pass.
@@ -619,6 +730,7 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
     size_t T = M->context_window;
     size_t V = M->vocab_size;
     size_t n_heads = M->num_attention_heads;
+    size_t fc_dim = 4 * D;
     
     /* ===== GLOBAL GRADIENT STORAGE ===== */
     
@@ -631,6 +743,10 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
     M->gradients.final_output_copy_offset = bump(&off, T * D, CACHE_ALIGN);
     M->gradients.d_final_output_offset = bump(&off, T * D, CACHE_ALIGN);
     M->gradients.d_embed_weights_offset = bump(&off, V * D, CACHE_ALIGN);
+    allocate_optimizer_buffers(M, &off, (size_t)V * D,
+                               &M->gradients.token_emb_m_offset,
+                               &M->gradients.token_emb_v_offset,
+                               &M->gradients.token_emb_ema_offset);
     
     // Stage 3: Final LayerNorm
     M->gradients.final_ln_input_copy_offset = bump(&off, T * D, CACHE_ALIGN);
@@ -641,6 +757,14 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
     M->gradients.d_final_ln_input_offset = bump(&off, T * D, CACHE_ALIGN);
     M->gradients.d_final_ln_gamma_offset = bump(&off, D, CACHE_ALIGN);
     M->gradients.d_final_ln_beta_offset = bump(&off, D, CACHE_ALIGN);
+    allocate_optimizer_buffers(M, &off, D,
+                               &M->gradients.final_ln_gamma_m_offset,
+                               &M->gradients.final_ln_gamma_v_offset,
+                               &M->gradients.final_ln_gamma_ema_offset);
+    allocate_optimizer_buffers(M, &off, D,
+                               &M->gradients.final_ln_beta_m_offset,
+                               &M->gradients.final_ln_beta_v_offset,
+                               &M->gradients.final_ln_beta_ema_offset);
     
     /* ===== PER-LAYER GRADIENT STORAGE ===== */
     
@@ -664,12 +788,28 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
         L->d_fc2_input_offset = bump(&off, T * 4 * D, CACHE_ALIGN);
         L->d_fc2_weights_offset = bump(&off, 4 * D * D, CACHE_ALIGN);
         L->d_fc2_bias_offset = bump(&off, D, CACHE_ALIGN);
+        allocate_optimizer_buffers(M, &off, fc_dim * D,
+                                   &L->fc2_weight_m_offset,
+                                   &L->fc2_weight_v_offset,
+                                   &L->fc2_weight_ema_offset);
+        allocate_optimizer_buffers(M, &off, D,
+                                   &L->fc2_bias_m_offset,
+                                   &L->fc2_bias_v_offset,
+                                   &L->fc2_bias_ema_offset);
         L->fc1_output_copy_offset = bump(&off, T * 4 * D, CACHE_ALIGN);
         L->d_fc1_output_offset = bump(&off, T * 4 * D, CACHE_ALIGN);
         L->ln2_output_copy_offset = bump(&off, T * D, CACHE_ALIGN);
         L->d_ln2_output_offset = bump(&off, T * D, CACHE_ALIGN);
         L->d_fc1_weights_offset = bump(&off, D * 4 * D, CACHE_ALIGN);
         L->d_fc1_bias_offset = bump(&off, 4 * D, CACHE_ALIGN);
+        allocate_optimizer_buffers(M, &off, D * fc_dim,
+                                   &L->fc1_weight_m_offset,
+                                   &L->fc1_weight_v_offset,
+                                   &L->fc1_weight_ema_offset);
+        allocate_optimizer_buffers(M, &off, fc_dim,
+                                   &L->fc1_bias_m_offset,
+                                   &L->fc1_bias_v_offset,
+                                   &L->fc1_bias_ema_offset);
 
         // LayerNorm2 Backward
         L->ln2_input_copy_offset = bump(&off, T * D, CACHE_ALIGN);
@@ -679,6 +819,14 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
         L->d_ln2_input_offset = bump(&off, T * D, CACHE_ALIGN);
         L->d_ln2_gamma_offset = bump(&off, D, CACHE_ALIGN);
         L->d_ln2_beta_offset = bump(&off, D, CACHE_ALIGN);
+        allocate_optimizer_buffers(M, &off, D,
+                                   &L->ln2_gamma_m_offset,
+                                   &L->ln2_gamma_v_offset,
+                                   &L->ln2_gamma_ema_offset);
+        allocate_optimizer_buffers(M, &off, D,
+                                   &L->ln2_beta_m_offset,
+                                   &L->ln2_beta_v_offset,
+                                   &L->ln2_beta_ema_offset);
 
         // Attention Backward
         L->residual1_copy_offset = bump(&off, T * D, CACHE_ALIGN);
@@ -689,6 +837,14 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
         L->d_attention_head_offset = bump(&off, n_heads * T * H, CACHE_ALIGN);
         L->d_proj_weights_offset = bump(&off, D * D, CACHE_ALIGN);
         L->d_proj_bias_offset = bump(&off, D, CACHE_ALIGN);
+        allocate_optimizer_buffers(M, &off, D * D,
+                                   &L->proj_weight_m_offset,
+                                   &L->proj_weight_v_offset,
+                                   &L->proj_weight_ema_offset);
+        allocate_optimizer_buffers(M, &off, D,
+                                   &L->proj_bias_m_offset,
+                                   &L->proj_bias_v_offset,
+                                   &L->proj_bias_ema_offset);
 
         // Attention mechanism
         L->attention_weights_copy_offset = bump(&off, n_heads * T * T, CACHE_ALIGN);
@@ -706,10 +862,34 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
         L->d_ln1_output_offset = bump(&off, T * D, CACHE_ALIGN);
         L->d_q_weights_offset = bump(&off, D * D, CACHE_ALIGN);
         L->d_q_bias_offset = bump(&off, D, CACHE_ALIGN);
+        allocate_optimizer_buffers(M, &off, D * D,
+                                   &L->q_weight_m_offset,
+                                   &L->q_weight_v_offset,
+                                   &L->q_weight_ema_offset);
+        allocate_optimizer_buffers(M, &off, D,
+                                   &L->q_bias_m_offset,
+                                   &L->q_bias_v_offset,
+                                   &L->q_bias_ema_offset);
         L->d_k_weights_offset = bump(&off, D * D, CACHE_ALIGN);
         L->d_k_bias_offset = bump(&off, D, CACHE_ALIGN);
+        allocate_optimizer_buffers(M, &off, D * D,
+                                   &L->k_weight_m_offset,
+                                   &L->k_weight_v_offset,
+                                   &L->k_weight_ema_offset);
+        allocate_optimizer_buffers(M, &off, D,
+                                   &L->k_bias_m_offset,
+                                   &L->k_bias_v_offset,
+                                   &L->k_bias_ema_offset);
         L->d_v_weights_offset = bump(&off, D * D, CACHE_ALIGN);
         L->d_v_bias_offset = bump(&off, D, CACHE_ALIGN);
+        allocate_optimizer_buffers(M, &off, D * D,
+                                   &L->v_weight_m_offset,
+                                   &L->v_weight_v_offset,
+                                   &L->v_weight_ema_offset);
+        allocate_optimizer_buffers(M, &off, D,
+                                   &L->v_bias_m_offset,
+                                   &L->v_bias_v_offset,
+                                   &L->v_bias_ema_offset);
         L->qkv_scratch_offset = bump(&off, T * D, CACHE_ALIGN);
 
         // LayerNorm1 Backward
@@ -720,10 +900,22 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
         L->d_ln1_input_offset = bump(&off, T * D, CACHE_ALIGN);
         L->d_ln1_gamma_offset = bump(&off, D, CACHE_ALIGN);
         L->d_ln1_beta_offset = bump(&off, D, CACHE_ALIGN);
+        allocate_optimizer_buffers(M, &off, D,
+                                   &L->ln1_gamma_m_offset,
+                                   &L->ln1_gamma_v_offset,
+                                   &L->ln1_gamma_ema_offset);
+        allocate_optimizer_buffers(M, &off, D,
+                                   &L->ln1_beta_m_offset,
+                                   &L->ln1_beta_v_offset,
+                                   &L->ln1_beta_ema_offset);
     }
     
     // 5. Embeddings (last in backward)
     M->gradients.d_pos_embed_offset = bump(&off, T * D, CACHE_ALIGN);
+    allocate_optimizer_buffers(M, &off, (size_t)T * D,
+                               &M->gradients.pos_emb_m_offset,
+                               &M->gradients.pos_emb_v_offset,
+                               &M->gradients.pos_emb_ema_offset);
     
     if (M->training_enabled) {
         size_t tokens_per_pair = (size_t)T + 1; // context + next-token target
@@ -749,6 +941,15 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
         M->gradients.d_seq_cls_pooled_offset = bump(&off, D, CACHE_ALIGN);
         M->gradients.d_seq_cls_weight_offset = bump(&off, (size_t)M->seq_cls_num_classes * D, CACHE_ALIGN);
         M->gradients.d_seq_cls_bias_offset = bump(&off, M->seq_cls_num_classes, CACHE_ALIGN);
+        size_t cls_weight_count = (size_t)M->seq_cls_num_classes * D;
+        allocate_optimizer_buffers(M, &off, cls_weight_count,
+                                   &M->gradients.seq_cls_weight_m_offset,
+                                   &M->gradients.seq_cls_weight_v_offset,
+                                   &M->gradients.seq_cls_weight_ema_offset);
+        allocate_optimizer_buffers(M, &off, M->seq_cls_num_classes,
+                                   &M->gradients.seq_cls_bias_m_offset,
+                                   &M->gradients.seq_cls_bias_v_offset,
+                                   &M->gradients.seq_cls_bias_ema_offset);
     } else {
         M->gradients.seq_cls_logits_offset = 0;
         M->gradients.d_seq_cls_logits_offset = 0;
@@ -756,6 +957,12 @@ void layout_gradients(TransformerModel *M, size_t *offset) {
         M->gradients.d_seq_cls_pooled_offset = 0;
         M->gradients.d_seq_cls_weight_offset = 0;
         M->gradients.d_seq_cls_bias_offset = 0;
+        M->gradients.seq_cls_weight_m_offset = 0;
+        M->gradients.seq_cls_weight_v_offset = 0;
+        M->gradients.seq_cls_weight_ema_offset = 0;
+        M->gradients.seq_cls_bias_m_offset = 0;
+        M->gradients.seq_cls_bias_v_offset = 0;
+        M->gradients.seq_cls_bias_ema_offset = 0;
     }
     
     // Update total gradient floats
@@ -969,6 +1176,18 @@ static void ensure_model_header_defaults(TransformerModel *M) {
     M->training_cache_samples = 0;
     M->active_tokens = 0;
     M->task_type = TASK_LM;
+    M->lr_warmup_steps = 0;
+    M->lr_warmup_init = 0.0f;
+    M->grad_clip = 0.0f;
+    M->optimizer = OPTIMIZER_SGD;
+    M->optimizer_step = 0;
+    M->adam_beta1 = 0.9f;
+    M->adam_beta2 = 0.95f;
+    M->adam_eps = 1e-8f;
+    M->weight_decay = 0.0f;
+    M->ema_enabled = false;
+    M->ema_decay = 0.0f;
+    M->optimizer_state_initialized = false;
     M->seq_cls_enabled = false;
     M->seq_cls_num_classes = 0;
     M->seq_cls_pooling = 0;
@@ -7088,6 +7307,12 @@ typedef struct {
     uint16_t *target_lengths; // target_len per sample
 } PreloadedTrainingData;
 
+static void initialize_optimizer_state(TransformerModel *M);
+static inline void apply_optimizer_update(TransformerModel *M, float learning_rate);
+static inline float compute_scheduled_lr(const TransformerModel *M,
+                                         float base_lr,
+                                         int step_index);
+
 static bool shuffle_training_pairs(TrainingPairList *list);
 
 static bool preload_all_training_windows(const TrainingPairList *list,
@@ -7267,142 +7492,6 @@ float training_step(TransformerModel *M,
                     int32_t *target_tokens,
                     int32_t seq_label,
                     int ctx_len,
-                    float learning_rate);
-
-static void run_training_loop(TransformerModel *M,
-                              const char *train_dir,
-                              TrainingPairList *list,
-                              int total_steps,
-                              float learning_rate,
-                              int log_interval,
-                              const char *checkpoint_dir,
-                              int checkpoint_interval) {
-    if (!list || list->count == 0) {
-        fprintf(stderr, "❌ Training pair list is empty for %s\n", train_dir ? train_dir : "(unknown)");
-        return;
-    }
-
-    shuffle_training_pairs(list);
-    if (M->gradients.training_pair_tokens_offset == 0) {
-        fprintf(stderr, "❌ Training buffers not allocated. Ensure training mode is enabled before layout.\n");
-        return;
-    }
-
-    PreloadedTrainingData preloaded = {0};
-    if (!preload_all_training_windows(list, M, &preloaded, M->num_cores)) {
-        fprintf(stderr, "❌ Failed to preload training data. Aborting.\n");
-        return;
-    }
-    
-    if (total_steps <= 0) {
-        total_steps = (int)preloaded.count;
-    }
-    if (log_interval <= 0) {
-        log_interval = 10;
-    }
-    if (learning_rate <= 0.0f) {
-        learning_rate = 1e-4f;
-    }
-    
-    bool checkpoints_enabled = (checkpoint_dir && checkpoint_dir[0] != '\0');
-    if (checkpoints_enabled && !ensure_directory_exists(checkpoint_dir)) {
-        checkpoints_enabled = false;
-    }
-    if (checkpoints_enabled && checkpoint_interval <= 0) {
-        checkpoint_interval = 50;
-    }
-    
-    size_t pair_index = 0;
-    const char *last_sample_path = list->paths[0];
-    printf("\n🎯 Starting training loop (%d steps, lr=%.6f) using preloaded data from %s\n",
-           total_steps, learning_rate, train_dir);
-    double training_start = get_time_sec();
-    double last_log_time = training_start;
-    
-    bool canary_verified_once = false;
-    
-    for (int step = 0; step < total_steps; ++step) {
-        size_t current = pair_index;
-        pair_index = (pair_index + 1) % preloaded.count;
-        uint32_t *pair_tokens = preloaded.cache_base + current * preloaded.stride;
-        int32_t *input_tokens = (int32_t *)pair_tokens;
-        uint16_t ctx_len = preloaded.ctx_lengths ? preloaded.ctx_lengths[current] : (uint16_t)M->context_window;
-        if (ctx_len == 0 || ctx_len > M->context_window) {
-            ctx_len = (uint16_t)M->context_window;
-        }
-        int32_t *target_tokens = input_tokens + 1;
-        int32_t seq_label = 0;
-        last_sample_path = list->paths[current];
-        
-        float loss = training_step(M, input_tokens, target_tokens, seq_label, ctx_len, learning_rate);
-        
-        if (!canary_verified_once) {
-            if (!verify_canaries(M, "first training step")) {
-                fprintf(stderr, "💥 Aborting due to memory canary corruption.\n");
-                exit(EXIT_FAILURE);
-            }
-            canary_verified_once = true;
-            printf("🛡️  Canary check passed after first training step.\n");
-        }
-        
-        if ((step + 1) % log_interval == 0 || step == 0) {
-            double now = get_time_sec();
-            double window = now - last_log_time;
-            double total_elapsed = now - training_start;
-            double steps_per_sec = (total_elapsed > 0.0) ? ((double)(step + 1) / total_elapsed) : 0.0;
-            if (M->task_type == TASK_LM) {
-                float ppl = expf(loss);
-                printf("[train] step=%d/%d  loss=%.6f  perplexity=%.2f  sample=%s  Δt=%.2fs  total=%.2fs  steps/s=%.2f\n",
-                       step + 1, total_steps, loss, ppl, last_sample_path,
-                       window, total_elapsed, steps_per_sec);
-            } else {
-                printf("[train] step=%d/%d  loss=%.6f  sample=%s  Δt=%.2fs  total=%.2fs  steps/s=%.2f\n",
-                       step + 1, total_steps, loss, last_sample_path,
-                       window, total_elapsed, steps_per_sec);
-            }
-            last_log_time = now;
-        }
-        
-        if (checkpoints_enabled && checkpoint_interval > 0 &&
-            ((step + 1) % checkpoint_interval == 0)) {
-            char ckpt_path[PATH_MAX];
-            snprintf(ckpt_path, sizeof(ckpt_path), "%s/ckpt_step_%06d.weights",
-                     checkpoint_dir, step + 1);
-            if (save_model_weights(M, ckpt_path) != 0) {
-                fprintf(stderr, "⚠️  Failed to save checkpoint at step %d\n", step + 1);
-            }
-        }
-    }
-    
-    double training_total = get_time_sec() - training_start;
-    double avg_steps_per_sec = (training_total > 0.0) ? ((double)total_steps / training_total) : 0.0;
-    printf("✅ Training complete. ⏱️  total=%.2fs  avg steps/s=%.2f\n", training_total, avg_steps_per_sec);
-    
-    if (checkpoints_enabled) {
-        char final_path[PATH_MAX];
-        snprintf(final_path, sizeof(final_path), "%s/ckpt_final.weights", checkpoint_dir);
-        if (save_model_weights(M, final_path) != 0) {
-            fprintf(stderr, "⚠️  Failed to save final checkpoint\n");
-        }
-    }
-
-    if (preloaded.ctx_lengths) {
-        free(preloaded.ctx_lengths);
-        preloaded.ctx_lengths = NULL;
-    }
-    if (preloaded.target_lengths) {
-        free(preloaded.target_lengths);
-        preloaded.target_lengths = NULL;
-    }
-}
-
-void update_all_weights_sgd(TransformerModel *M, float learning_rate);
-
-float training_step(TransformerModel *M, 
-                    int32_t *input_tokens,
-                    int32_t *target_tokens,
-                    int32_t seq_label,
-                    int ctx_len,
                     float learning_rate) {
     
     if (ctx_len <= 0 || ctx_len > M->context_window) {
@@ -7478,128 +7567,638 @@ float training_step(TransformerModel *M,
     backward_embedding_layer(M);
 
     // ======== WEIGHT UPDATE ========
-    update_all_weights_sgd(M, learning_rate);
+    apply_optimizer_update(M, learning_rate);
 
     return total_loss;
 }
 
-void update_all_weights_sgd(TransformerModel *M, float learning_rate) {
-    size_t aligned_dim = M->aligned_embed_dim;
-    size_t aligned_fc = 4 * aligned_dim;
-    
-    // Update token embeddings (shared with LM head)
-    for (size_t i = 0; i < (size_t)M->vocab_size * aligned_dim; i++) {
-        M->memory_base[M->token_emb_offset + i] -=
-            learning_rate * M->memory_base[M->gradients.d_embed_weights_offset + i];
+static void run_training_loop(TransformerModel *M,
+                              const char *train_dir,
+                              TrainingPairList *list,
+                              int total_steps,
+                              float learning_rate,
+                              int log_interval,
+                              const char *checkpoint_dir,
+                              int checkpoint_interval) {
+    if (!list || list->count == 0) {
+        fprintf(stderr, "❌ Training pair list is empty for %s\n", train_dir ? train_dir : "(unknown)");
+        return;
+    }
+
+    shuffle_training_pairs(list);
+    if (M->gradients.training_pair_tokens_offset == 0) {
+        fprintf(stderr, "❌ Training buffers not allocated. Ensure training mode is enabled before layout.\n");
+        return;
+    }
+
+    PreloadedTrainingData preloaded = {0};
+    if (!preload_all_training_windows(list, M, &preloaded, M->num_cores)) {
+        fprintf(stderr, "❌ Failed to preload training data. Aborting.\n");
+        return;
     }
     
-    // Update positional embeddings
-    for (size_t i = 0; i < (size_t)M->context_window * aligned_dim; i++) {
-        M->memory_base[M->pos_emb_offset + i] -=
-            learning_rate * M->memory_base[M->gradients.d_pos_embed_offset + i];
+    if (total_steps <= 0) {
+        total_steps = (int)preloaded.count;
+    }
+    if (log_interval <= 0) {
+        log_interval = 10;
+    }
+    if (learning_rate <= 0.0f) {
+        learning_rate = 1e-4f;
+    }
+    float base_lr = learning_rate;
+    M->learning_rate = base_lr;
+    initialize_optimizer_state(M);
+    
+    bool checkpoints_enabled = (checkpoint_dir && checkpoint_dir[0] != '\0');
+    if (checkpoints_enabled && !ensure_directory_exists(checkpoint_dir)) {
+        checkpoints_enabled = false;
+    }
+    if (checkpoints_enabled && checkpoint_interval <= 0) {
+        checkpoint_interval = 50;
     }
     
-    // Update each transformer layer
-    for (int l = 0; l < M->num_layers; l++) {
+    size_t pair_index = 0;
+    const char *last_sample_path = list->paths[0];
+    printf("\n🎯 Starting training loop (%d steps, base lr=%.6f, warmup=%d, clip=%.3f) using preloaded data from %s\n",
+           total_steps, base_lr, M->lr_warmup_steps, M->grad_clip, train_dir);
+    double training_start = get_time_sec();
+    double last_log_time = training_start;
+    
+    bool canary_verified_once = false;
+    
+    for (int step = 0; step < total_steps; ++step) {
+        size_t current = pair_index;
+        pair_index = (pair_index + 1) % preloaded.count;
+        uint32_t *pair_tokens = preloaded.cache_base + current * preloaded.stride;
+        int32_t *input_tokens = (int32_t *)pair_tokens;
+        uint16_t ctx_len = preloaded.ctx_lengths ? preloaded.ctx_lengths[current] : (uint16_t)M->context_window;
+        if (ctx_len == 0 || ctx_len > M->context_window) {
+            ctx_len = (uint16_t)M->context_window;
+        }
+        int32_t *target_tokens = input_tokens + 1;
+        int32_t seq_label = 0;
+        last_sample_path = list->paths[current];
+        
+        float step_lr = compute_scheduled_lr(M, base_lr, step);
+        M->learning_rate = step_lr;
+        float loss = training_step(M, input_tokens, target_tokens, seq_label, ctx_len, step_lr);
+        
+        if (!canary_verified_once) {
+            if (!verify_canaries(M, "first training step")) {
+                fprintf(stderr, "💥 Aborting due to memory canary corruption.\n");
+                exit(EXIT_FAILURE);
+            }
+            canary_verified_once = true;
+            printf("🛡️  Canary check passed after first training step.\n");
+        }
+        
+        if ((step + 1) % log_interval == 0 || step == 0) {
+            double now = get_time_sec();
+            double window = now - last_log_time;
+            double total_elapsed = now - training_start;
+            double steps_per_sec = (total_elapsed > 0.0) ? ((double)(step + 1) / total_elapsed) : 0.0;
+            if (M->task_type == TASK_LM) {
+                float ppl = expf(loss);
+                printf("[train] step=%d/%d  loss=%.6f  perplexity=%.2f  lr=%.6f  sample=%s  Δt=%.2fs  total=%.2fs  steps/s=%.2f\n",
+                       step + 1, total_steps, loss, ppl, step_lr, last_sample_path,
+                       window, total_elapsed, steps_per_sec);
+            } else {
+                printf("[train] step=%d/%d  loss=%.6f  lr=%.6f  sample=%s  Δt=%.2fs  total=%.2fs  steps/s=%.2f\n",
+                       step + 1, total_steps, loss, step_lr, last_sample_path,
+                       window, total_elapsed, steps_per_sec);
+            }
+            last_log_time = now;
+        }
+        
+        if (checkpoints_enabled && checkpoint_interval > 0 &&
+            ((step + 1) % checkpoint_interval == 0)) {
+            char ckpt_path[PATH_MAX];
+            snprintf(ckpt_path, sizeof(ckpt_path), "%s/ckpt_step_%06d.weights",
+                     checkpoint_dir, step + 1);
+            if (save_model_weights(M, ckpt_path) != 0) {
+                fprintf(stderr, "⚠️  Failed to save checkpoint at step %d\n", step + 1);
+            }
+        }
+    }
+    
+    double training_total = get_time_sec() - training_start;
+    double avg_steps_per_sec = (training_total > 0.0) ? ((double)total_steps / training_total) : 0.0;
+    printf("✅ Training complete. ⏱️  total=%.2fs  avg steps/s=%.2f\n", training_total, avg_steps_per_sec);
+    
+    if (checkpoints_enabled) {
+        char final_path[PATH_MAX];
+        snprintf(final_path, sizeof(final_path), "%s/ckpt_final.weights", checkpoint_dir);
+        if (save_model_weights(M, final_path) != 0) {
+            fprintf(stderr, "⚠️  Failed to save final checkpoint\n");
+        }
+    }
+
+    if (preloaded.ctx_lengths) {
+        free(preloaded.ctx_lengths);
+        preloaded.ctx_lengths = NULL;
+    }
+    if (preloaded.target_lengths) {
+        free(preloaded.target_lengths);
+        preloaded.target_lengths = NULL;
+    }
+}
+
+static inline void initialize_optimizer_tensor(float *base,
+                                               size_t weight_offset,
+                                               size_t count,
+                                               size_t m_offset,
+                                               size_t v_offset,
+                                               size_t ema_offset,
+                                               bool zero_moments,
+                                               bool init_ema) {
+    if (count == 0 || (!zero_moments && !init_ema)) {
+        return;
+    }
+    size_t bytes = count * sizeof(float);
+    if (zero_moments) {
+        if (m_offset) {
+            memset(base + m_offset, 0, bytes);
+        }
+        if (v_offset) {
+            memset(base + v_offset, 0, bytes);
+        }
+    }
+    if (init_ema && ema_offset) {
+        memcpy(base + ema_offset, base + weight_offset, bytes);
+    }
+}
+
+static void initialize_optimizer_state(TransformerModel *M) {
+    if (M->optimizer_state_initialized || !M->training_enabled || !M->memory_base) {
+        return;
+    }
+    bool zero_moments = (M->optimizer == OPTIMIZER_ADAM);
+    bool init_ema = M->ema_enabled && (M->ema_decay > 0.0f);
+    if (!zero_moments && !init_ema) {
+        M->optimizer_state_initialized = true;
+        return;
+    }
+
+    float *base = M->memory_base;
+    size_t D = M->aligned_embed_dim;
+    size_t fc_dim = 4 * D;
+
+    initialize_optimizer_tensor(base, M->token_emb_offset,
+                                (size_t)M->vocab_size * D,
+                                M->gradients.token_emb_m_offset,
+                                M->gradients.token_emb_v_offset,
+                                M->gradients.token_emb_ema_offset,
+                                zero_moments, init_ema);
+    initialize_optimizer_tensor(base, M->pos_emb_offset,
+                                (size_t)M->context_window * D,
+                                M->gradients.pos_emb_m_offset,
+                                M->gradients.pos_emb_v_offset,
+                                M->gradients.pos_emb_ema_offset,
+                                zero_moments, init_ema);
+    initialize_optimizer_tensor(base, M->final_ln_weight_offset, D,
+                                M->gradients.final_ln_gamma_m_offset,
+                                M->gradients.final_ln_gamma_v_offset,
+                                M->gradients.final_ln_gamma_ema_offset,
+                                zero_moments, init_ema);
+    initialize_optimizer_tensor(base, M->final_ln_bias_offset, D,
+                                M->gradients.final_ln_beta_m_offset,
+                                M->gradients.final_ln_beta_v_offset,
+                                M->gradients.final_ln_beta_ema_offset,
+                                zero_moments, init_ema);
+
+    for (int l = 0; l < M->num_layers; ++l) {
+        TrulyOptimalLayer *layer = &M->layers[l];
         LayerGradients *LG = &M->gradients.layers[l];
-        TrulyOptimalLayer *L = &M->layers[l];
-        
-        // LayerNorm 1 parameters
-        for (size_t i = 0; i < aligned_dim; i++) {
-            M->memory_base[L->ln1_weight_offset + i] -=
-                learning_rate * M->memory_base[LG->d_ln1_gamma_offset + i];
-            M->memory_base[L->ln1_bias_offset + i] -=
-                learning_rate * M->memory_base[LG->d_ln1_beta_offset + i];
-        }
-        
-        // Q weights/bias
-        for (size_t i = 0; i < aligned_dim * aligned_dim; i++) {
-            M->memory_base[L->q_weight_offset + i] -=
-                learning_rate * M->memory_base[LG->d_q_weights_offset + i];
-        }
-        for (size_t i = 0; i < aligned_dim; i++) {
-            M->memory_base[L->q_bias_offset + i] -=
-                learning_rate * M->memory_base[LG->d_q_bias_offset + i];
-        }
-        
-        // K weights/bias
-        for (size_t i = 0; i < aligned_dim * aligned_dim; i++) {
-            M->memory_base[L->k_weight_offset + i] -=
-                learning_rate * M->memory_base[LG->d_k_weights_offset + i];
-        }
-        for (size_t i = 0; i < aligned_dim; i++) {
-            M->memory_base[L->k_bias_offset + i] -=
-                learning_rate * M->memory_base[LG->d_k_bias_offset + i];
-        }
-        
-        // V weights/bias
-        for (size_t i = 0; i < aligned_dim * aligned_dim; i++) {
-            M->memory_base[L->v_weight_offset + i] -=
-                learning_rate * M->memory_base[LG->d_v_weights_offset + i];
-        }
-        for (size_t i = 0; i < aligned_dim; i++) {
-            M->memory_base[L->v_bias_offset + i] -=
-                learning_rate * M->memory_base[LG->d_v_bias_offset + i];
-        }
-        
-        // Projection weights/bias
-        for (size_t i = 0; i < aligned_dim * aligned_dim; i++) {
-            M->memory_base[L->proj_weight_offset + i] -=
-                learning_rate * M->memory_base[LG->d_proj_weights_offset + i];
-        }
-        for (size_t i = 0; i < aligned_dim; i++) {
-            M->memory_base[L->proj_bias_offset + i] -=
-                learning_rate * M->memory_base[LG->d_proj_bias_offset + i];
-        }
-        
-        // LayerNorm 2 parameters
-        for (size_t i = 0; i < aligned_dim; i++) {
-            M->memory_base[L->ln2_weight_offset + i] -=
-                learning_rate * M->memory_base[LG->d_ln2_gamma_offset + i];
-            M->memory_base[L->ln2_bias_offset + i] -=
-                learning_rate * M->memory_base[LG->d_ln2_beta_offset + i];
-        }
-        
-        // MLP weights/biases (FC1 expands to 4D, FC2 contracts back)
-        for (size_t i = 0; i < aligned_dim * aligned_fc; i++) {
-            M->memory_base[L->fc1_weight_offset + i] -=
-                learning_rate * M->memory_base[LG->d_fc1_weights_offset + i];
-        }
-        for (size_t i = 0; i < aligned_fc; i++) {
-            M->memory_base[L->fc1_bias_offset + i] -=
-                learning_rate * M->memory_base[LG->d_fc1_bias_offset + i];
-        }
-        for (size_t i = 0; i < aligned_fc * aligned_dim; i++) {
-            M->memory_base[L->fc2_weight_offset + i] -=
-                learning_rate * M->memory_base[LG->d_fc2_weights_offset + i];
-        }
-        for (size_t i = 0; i < aligned_dim; i++) {
-            M->memory_base[L->fc2_bias_offset + i] -=
-                learning_rate * M->memory_base[LG->d_fc2_bias_offset + i];
-        }
-    }
-    
-    // Update final layernorm parameters
-    for (size_t i = 0; i < aligned_dim; i++) {
-        M->memory_base[M->final_ln_weight_offset + i] -=
-            learning_rate * M->memory_base[M->gradients.d_final_ln_gamma_offset + i];
-        M->memory_base[M->final_ln_bias_offset + i] -=
-            learning_rate * M->memory_base[M->gradients.d_final_ln_beta_offset + i];
+        initialize_optimizer_tensor(base, layer->ln1_weight_offset, D,
+                                    LG->ln1_gamma_m_offset,
+                                    LG->ln1_gamma_v_offset,
+                                    LG->ln1_gamma_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->ln1_bias_offset, D,
+                                    LG->ln1_beta_m_offset,
+                                    LG->ln1_beta_v_offset,
+                                    LG->ln1_beta_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->q_weight_offset, D * D,
+                                    LG->q_weight_m_offset,
+                                    LG->q_weight_v_offset,
+                                    LG->q_weight_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->q_bias_offset, D,
+                                    LG->q_bias_m_offset,
+                                    LG->q_bias_v_offset,
+                                    LG->q_bias_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->k_weight_offset, D * D,
+                                    LG->k_weight_m_offset,
+                                    LG->k_weight_v_offset,
+                                    LG->k_weight_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->k_bias_offset, D,
+                                    LG->k_bias_m_offset,
+                                    LG->k_bias_v_offset,
+                                    LG->k_bias_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->v_weight_offset, D * D,
+                                    LG->v_weight_m_offset,
+                                    LG->v_weight_v_offset,
+                                    LG->v_weight_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->v_bias_offset, D,
+                                    LG->v_bias_m_offset,
+                                    LG->v_bias_v_offset,
+                                    LG->v_bias_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->proj_weight_offset, D * D,
+                                    LG->proj_weight_m_offset,
+                                    LG->proj_weight_v_offset,
+                                    LG->proj_weight_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->proj_bias_offset, D,
+                                    LG->proj_bias_m_offset,
+                                    LG->proj_bias_v_offset,
+                                    LG->proj_bias_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->ln2_weight_offset, D,
+                                    LG->ln2_gamma_m_offset,
+                                    LG->ln2_gamma_v_offset,
+                                    LG->ln2_gamma_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->ln2_bias_offset, D,
+                                    LG->ln2_beta_m_offset,
+                                    LG->ln2_beta_v_offset,
+                                    LG->ln2_beta_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->fc1_weight_offset, D * fc_dim,
+                                    LG->fc1_weight_m_offset,
+                                    LG->fc1_weight_v_offset,
+                                    LG->fc1_weight_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->fc1_bias_offset, fc_dim,
+                                    LG->fc1_bias_m_offset,
+                                    LG->fc1_bias_v_offset,
+                                    LG->fc1_bias_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->fc2_weight_offset, fc_dim * D,
+                                    LG->fc2_weight_m_offset,
+                                    LG->fc2_weight_v_offset,
+                                    LG->fc2_weight_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, layer->fc2_bias_offset, D,
+                                    LG->fc2_bias_m_offset,
+                                    LG->fc2_bias_v_offset,
+                                    LG->fc2_bias_ema_offset,
+                                    zero_moments, init_ema);
     }
 
     if (M->seq_cls_enabled && M->seq_cls_num_classes > 0) {
-        size_t cls_count = (size_t)M->seq_cls_num_classes * aligned_dim;
-        float *cls_weights = M->memory_base + M->seq_cls_weight_offset;
-        float *d_cls_weights = M->memory_base + M->gradients.d_seq_cls_weight_offset;
-        for (size_t i = 0; i < cls_count; ++i) {
-            cls_weights[i] -= learning_rate * d_cls_weights[i];
+        size_t cls_weights = (size_t)M->seq_cls_num_classes * D;
+        initialize_optimizer_tensor(base, M->seq_cls_weight_offset, cls_weights,
+                                    M->gradients.seq_cls_weight_m_offset,
+                                    M->gradients.seq_cls_weight_v_offset,
+                                    M->gradients.seq_cls_weight_ema_offset,
+                                    zero_moments, init_ema);
+        initialize_optimizer_tensor(base, M->seq_cls_bias_offset, M->seq_cls_num_classes,
+                                    M->gradients.seq_cls_bias_m_offset,
+                                    M->gradients.seq_cls_bias_v_offset,
+                                    M->gradients.seq_cls_bias_ema_offset,
+                                    zero_moments, init_ema);
+    }
+
+    M->optimizer_state_initialized = true;
+}
+
+static inline float clip_grad_value(float grad, float limit) {
+    if (limit <= 0.0f) {
+        return grad;
+    }
+    if (grad > limit) {
+        return limit;
+    }
+    if (grad < -limit) {
+        return -limit;
+    }
+    return grad;
+}
+
+static inline void sgd_update_tensor(TransformerModel *M,
+                                     size_t weight_offset,
+                                     size_t grad_offset,
+                                     size_t ema_offset,
+                                     size_t count,
+                                     float learning_rate,
+                                     float weight_decay,
+                                     float ema_decay) {
+    if (count == 0) {
+        return;
+    }
+    float *base = M->memory_base;
+    float *weights = base + weight_offset;
+    float *grads = base + grad_offset;
+    float *ema = (ema_offset && ema_decay > 0.0f) ? base + ema_offset : NULL;
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < count; ++i) {
+        float grad = grads[i];
+        if (weight_decay != 0.0f) {
+            grad += weight_decay * weights[i];
         }
-        float *cls_bias = M->memory_base + M->seq_cls_bias_offset;
-        float *d_cls_bias = M->memory_base + M->gradients.d_seq_cls_bias_offset;
-        for (int i = 0; i < M->seq_cls_num_classes; ++i) {
-            cls_bias[i] -= learning_rate * d_cls_bias[i];
+        grad = clip_grad_value(grad, M->grad_clip);
+        float updated = weights[i] - learning_rate * grad;
+        weights[i] = updated;
+        if (ema) {
+            ema[i] = ema_decay * ema[i] + (1.0f - ema_decay) * updated;
         }
     }
+}
+
+static inline void adam_update_tensor(TransformerModel *M,
+                                      size_t weight_offset,
+                                      size_t grad_offset,
+                                      size_t m_offset,
+                                      size_t v_offset,
+                                      size_t ema_offset,
+                                      size_t count,
+                                      float lr_t,
+                                      float beta1,
+                                      float beta2,
+                                      float eps,
+                                      float weight_decay,
+                                      float ema_decay) {
+    if (count == 0 || m_offset == 0 || v_offset == 0) {
+        return;
+    }
+    float *base = M->memory_base;
+    float *weights = base + weight_offset;
+    float *grads = base + grad_offset;
+    float *m = base + m_offset;
+    float *v = base + v_offset;
+    float *ema = (ema_offset && ema_decay > 0.0f) ? base + ema_offset : NULL;
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < count; ++i) {
+        float grad = grads[i];
+        if (weight_decay != 0.0f) {
+            grad += weight_decay * weights[i];
+        }
+        grad = clip_grad_value(grad, M->grad_clip);
+        float m_new = beta1 * m[i] + (1.0f - beta1) * grad;
+        float v_new = beta2 * v[i] + (1.0f - beta2) * (grad * grad);
+        m[i] = m_new;
+        v[i] = v_new;
+        float updated = weights[i] - lr_t * m_new / (sqrtf(v_new) + eps);
+        weights[i] = updated;
+        if (ema) {
+            ema[i] = ema_decay * ema[i] + (1.0f - ema_decay) * updated;
+        }
+    }
+}
+
+static void update_all_weights_sgd(TransformerModel *M, float learning_rate) {
+    size_t D = M->aligned_embed_dim;
+    size_t fc_dim = 4 * D;
+    float weight_decay = M->weight_decay;
+    float ema_decay = (M->ema_enabled ? M->ema_decay : 0.0f);
+
+    sgd_update_tensor(M, M->token_emb_offset,
+                      M->gradients.d_embed_weights_offset,
+                      M->gradients.token_emb_ema_offset,
+                      (size_t)M->vocab_size * D,
+                      learning_rate, weight_decay, ema_decay);
+    sgd_update_tensor(M, M->pos_emb_offset,
+                      M->gradients.d_pos_embed_offset,
+                      M->gradients.pos_emb_ema_offset,
+                      (size_t)M->context_window * D,
+                      learning_rate, weight_decay, ema_decay);
+    sgd_update_tensor(M, M->final_ln_weight_offset,
+                      M->gradients.d_final_ln_gamma_offset,
+                      M->gradients.final_ln_gamma_ema_offset,
+                      D, learning_rate, weight_decay, ema_decay);
+    sgd_update_tensor(M, M->final_ln_bias_offset,
+                      M->gradients.d_final_ln_beta_offset,
+                      M->gradients.final_ln_beta_ema_offset,
+                      D, learning_rate, weight_decay, ema_decay);
+
+    for (int l = 0; l < M->num_layers; ++l) {
+        TrulyOptimalLayer *L = &M->layers[l];
+        LayerGradients *LG = &M->gradients.layers[l];
+        sgd_update_tensor(M, L->ln1_weight_offset, LG->d_ln1_gamma_offset,
+                          LG->ln1_gamma_ema_offset, D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->ln1_bias_offset, LG->d_ln1_beta_offset,
+                          LG->ln1_beta_ema_offset, D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->q_weight_offset, LG->d_q_weights_offset,
+                          LG->q_weight_ema_offset, D * D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->q_bias_offset, LG->d_q_bias_offset,
+                          LG->q_bias_ema_offset, D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->k_weight_offset, LG->d_k_weights_offset,
+                          LG->k_weight_ema_offset, D * D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->k_bias_offset, LG->d_k_bias_offset,
+                          LG->k_bias_ema_offset, D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->v_weight_offset, LG->d_v_weights_offset,
+                          LG->v_weight_ema_offset, D * D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->v_bias_offset, LG->d_v_bias_offset,
+                          LG->v_bias_ema_offset, D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->proj_weight_offset, LG->d_proj_weights_offset,
+                          LG->proj_weight_ema_offset, D * D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->proj_bias_offset, LG->d_proj_bias_offset,
+                          LG->proj_bias_ema_offset, D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->ln2_weight_offset, LG->d_ln2_gamma_offset,
+                          LG->ln2_gamma_ema_offset, D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->ln2_bias_offset, LG->d_ln2_beta_offset,
+                          LG->ln2_beta_ema_offset, D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->fc1_weight_offset, LG->d_fc1_weights_offset,
+                          LG->fc1_weight_ema_offset, D * fc_dim,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->fc1_bias_offset, LG->d_fc1_bias_offset,
+                          LG->fc1_bias_ema_offset, fc_dim,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->fc2_weight_offset, LG->d_fc2_weights_offset,
+                          LG->fc2_weight_ema_offset, fc_dim * D,
+                          learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, L->fc2_bias_offset, LG->d_fc2_bias_offset,
+                          LG->fc2_bias_ema_offset, D,
+                          learning_rate, weight_decay, ema_decay);
+    }
+
+    if (M->seq_cls_enabled && M->seq_cls_num_classes > 0) {
+        size_t cls_weights = (size_t)M->seq_cls_num_classes * D;
+        sgd_update_tensor(M, M->seq_cls_weight_offset,
+                          M->gradients.d_seq_cls_weight_offset,
+                          M->gradients.seq_cls_weight_ema_offset,
+                          cls_weights, learning_rate, weight_decay, ema_decay);
+        sgd_update_tensor(M, M->seq_cls_bias_offset,
+                          M->gradients.d_seq_cls_bias_offset,
+                          M->gradients.seq_cls_bias_ema_offset,
+                          M->seq_cls_num_classes,
+                          learning_rate, weight_decay, ema_decay);
+    }
+}
+
+static void update_all_weights_adam(TransformerModel *M, float learning_rate) {
+    size_t D = M->aligned_embed_dim;
+    size_t fc_dim = 4 * D;
+    float beta1 = M->adam_beta1;
+    float beta2 = M->adam_beta2;
+    float eps = M->adam_eps;
+    float weight_decay = M->weight_decay;
+    float ema_decay = (M->ema_enabled ? M->ema_decay : 0.0f);
+
+    M->optimizer_step += 1;
+    float step = (float)M->optimizer_step;
+    float bc1 = 1.0f - powf(beta1, step);
+    float bc2 = 1.0f - powf(beta2, step);
+    if (bc1 < 1e-8f) bc1 = 1e-8f;
+    if (bc2 < 1e-8f) bc2 = 1e-8f;
+    float lr_t = learning_rate * sqrtf(bc2) / bc1;
+
+    adam_update_tensor(M, M->token_emb_offset,
+                       M->gradients.d_embed_weights_offset,
+                       M->gradients.token_emb_m_offset,
+                       M->gradients.token_emb_v_offset,
+                       M->gradients.token_emb_ema_offset,
+                       (size_t)M->vocab_size * D,
+                       lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+    adam_update_tensor(M, M->pos_emb_offset,
+                       M->gradients.d_pos_embed_offset,
+                       M->gradients.pos_emb_m_offset,
+                       M->gradients.pos_emb_v_offset,
+                       M->gradients.pos_emb_ema_offset,
+                       (size_t)M->context_window * D,
+                       lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+    adam_update_tensor(M, M->final_ln_weight_offset,
+                       M->gradients.d_final_ln_gamma_offset,
+                       M->gradients.final_ln_gamma_m_offset,
+                       M->gradients.final_ln_gamma_v_offset,
+                       M->gradients.final_ln_gamma_ema_offset,
+                       D, lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+    adam_update_tensor(M, M->final_ln_bias_offset,
+                       M->gradients.d_final_ln_beta_offset,
+                       M->gradients.final_ln_beta_m_offset,
+                       M->gradients.final_ln_beta_v_offset,
+                       M->gradients.final_ln_beta_ema_offset,
+                       D, lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+
+    for (int l = 0; l < M->num_layers; ++l) {
+        TrulyOptimalLayer *L = &M->layers[l];
+        LayerGradients *LG = &M->gradients.layers[l];
+        adam_update_tensor(M, L->ln1_weight_offset, LG->d_ln1_gamma_offset,
+                           LG->ln1_gamma_m_offset, LG->ln1_gamma_v_offset,
+                           LG->ln1_gamma_ema_offset, D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->ln1_bias_offset, LG->d_ln1_beta_offset,
+                           LG->ln1_beta_m_offset, LG->ln1_beta_v_offset,
+                           LG->ln1_beta_ema_offset, D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->q_weight_offset, LG->d_q_weights_offset,
+                           LG->q_weight_m_offset, LG->q_weight_v_offset,
+                           LG->q_weight_ema_offset, D * D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->q_bias_offset, LG->d_q_bias_offset,
+                           LG->q_bias_m_offset, LG->q_bias_v_offset,
+                           LG->q_bias_ema_offset, D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->k_weight_offset, LG->d_k_weights_offset,
+                           LG->k_weight_m_offset, LG->k_weight_v_offset,
+                           LG->k_weight_ema_offset, D * D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->k_bias_offset, LG->d_k_bias_offset,
+                           LG->k_bias_m_offset, LG->k_bias_v_offset,
+                           LG->k_bias_ema_offset, D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->v_weight_offset, LG->d_v_weights_offset,
+                           LG->v_weight_m_offset, LG->v_weight_v_offset,
+                           LG->v_weight_ema_offset, D * D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->v_bias_offset, LG->d_v_bias_offset,
+                           LG->v_bias_m_offset, LG->v_bias_v_offset,
+                           LG->v_bias_ema_offset, D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->proj_weight_offset, LG->d_proj_weights_offset,
+                           LG->proj_weight_m_offset, LG->proj_weight_v_offset,
+                           LG->proj_weight_ema_offset, D * D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->proj_bias_offset, LG->d_proj_bias_offset,
+                           LG->proj_bias_m_offset, LG->proj_bias_v_offset,
+                           LG->proj_bias_ema_offset, D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->ln2_weight_offset, LG->d_ln2_gamma_offset,
+                           LG->ln2_gamma_m_offset, LG->ln2_gamma_v_offset,
+                           LG->ln2_gamma_ema_offset, D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->ln2_bias_offset, LG->d_ln2_beta_offset,
+                           LG->ln2_beta_m_offset, LG->ln2_beta_v_offset,
+                           LG->ln2_beta_ema_offset, D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->fc1_weight_offset, LG->d_fc1_weights_offset,
+                           LG->fc1_weight_m_offset, LG->fc1_weight_v_offset,
+                           LG->fc1_weight_ema_offset, D * fc_dim,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->fc1_bias_offset, LG->d_fc1_bias_offset,
+                           LG->fc1_bias_m_offset, LG->fc1_bias_v_offset,
+                           LG->fc1_bias_ema_offset, fc_dim,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->fc2_weight_offset, LG->d_fc2_weights_offset,
+                           LG->fc2_weight_m_offset, LG->fc2_weight_v_offset,
+                           LG->fc2_weight_ema_offset, fc_dim * D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, L->fc2_bias_offset, LG->d_fc2_bias_offset,
+                           LG->fc2_bias_m_offset, LG->fc2_bias_v_offset,
+                           LG->fc2_bias_ema_offset, D,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+    }
+
+    if (M->seq_cls_enabled && M->seq_cls_num_classes > 0) {
+        size_t cls_weights = (size_t)M->seq_cls_num_classes * D;
+        adam_update_tensor(M, M->seq_cls_weight_offset,
+                           M->gradients.d_seq_cls_weight_offset,
+                           M->gradients.seq_cls_weight_m_offset,
+                           M->gradients.seq_cls_weight_v_offset,
+                           M->gradients.seq_cls_weight_ema_offset,
+                           cls_weights, lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+        adam_update_tensor(M, M->seq_cls_bias_offset,
+                           M->gradients.d_seq_cls_bias_offset,
+                           M->gradients.seq_cls_bias_m_offset,
+                           M->gradients.seq_cls_bias_v_offset,
+                           M->gradients.seq_cls_bias_ema_offset,
+                           M->seq_cls_num_classes,
+                           lr_t, beta1, beta2, eps, weight_decay, ema_decay);
+    }
+}
+
+static inline void apply_optimizer_update(TransformerModel *M, float learning_rate) {
+    if (M->optimizer == OPTIMIZER_ADAM) {
+        update_all_weights_adam(M, learning_rate);
+    } else {
+        update_all_weights_sgd(M, learning_rate);
+    }
+}
+
+static inline float compute_scheduled_lr(const TransformerModel *M,
+                                         float base_lr,
+                                         int step_index) {
+    if (M->lr_warmup_steps <= 0) {
+        return base_lr;
+    }
+    int warmup_total = M->lr_warmup_steps;
+    if (step_index < warmup_total) {
+        float start = (M->lr_warmup_init > 0.0f) ? M->lr_warmup_init : 0.0f;
+        float progress = (float)(step_index + 1) / (float)warmup_total;
+        return start + (base_lr - start) * progress;
+    }
+    return base_lr;
 }
 
 /**************************************************************/
@@ -7628,6 +8227,15 @@ int main(int argc, char **argv)
     size_t dataset_pairs = 0;
     int seq_cls_num_classes = 0;
     const char *seq_cls_pooling_str = "final";
+    const char *optimizer_name = "sgd";
+    float adam_beta1_cli = 0.9f;
+    float adam_beta2_cli = 0.95f;
+    float adam_eps_cli = 1e-8f;
+    float weight_decay_cli = 0.0f;
+    float ema_decay_cli = 0.0f;
+    int lr_warmup_steps_cli = 0;
+    float lr_warmup_init_cli = 0.0f;
+    float grad_clip_cli = 0.0f;
 
 #define CLEANUP_AND_RETURN(code)                     \
     do {                                             \
@@ -7657,6 +8265,15 @@ int main(int argc, char **argv)
         {"train-cache-samples", required_argument, 0, 1006},
         {"seq-cls-classes", required_argument, 0, 1007},
         {"seq-cls-pooling", required_argument, 0, 1008},
+        {"optimizer", required_argument, 0, 1009},
+        {"adam-beta1", required_argument, 0, 1010},
+        {"adam-beta2", required_argument, 0, 1011},
+        {"adam-eps", required_argument, 0, 1012},
+        {"weight-decay", required_argument, 0, 1013},
+        {"ema-decay", required_argument, 0, 1014},
+        {"lr-warmup-steps", required_argument, 0, 1015},
+        {"lr-warmup-init", required_argument, 0, 1016},
+        {"grad-clip", required_argument, 0, 1017},
         {0, 0, 0, 0}
     };
 
@@ -7719,8 +8336,47 @@ int main(int argc, char **argv)
         case 1008:
             seq_cls_pooling_str = optarg;
             break;
+        case 1009:
+            optimizer_name = optarg;
+            break;
+        case 1010:
+            adam_beta1_cli = strtof(optarg, NULL);
+            break;
+        case 1011:
+            adam_beta2_cli = strtof(optarg, NULL);
+            break;
+        case 1012:
+            adam_eps_cli = strtof(optarg, NULL);
+            break;
+        case 1013:
+            weight_decay_cli = strtof(optarg, NULL);
+            break;
+        case 1014:
+            ema_decay_cli = strtof(optarg, NULL);
+            if (ema_decay_cli < 0.0f) {
+                ema_decay_cli = 0.0f;
+            }
+            break;
+        case 1015:
+            lr_warmup_steps_cli = atoi(optarg);
+            if (lr_warmup_steps_cli < 0) {
+                lr_warmup_steps_cli = 0;
+            }
+            break;
+        case 1016:
+            lr_warmup_init_cli = strtof(optarg, NULL);
+            if (lr_warmup_init_cli < 0.0f) {
+                lr_warmup_init_cli = 0.0f;
+            }
+            break;
+        case 1017:
+            grad_clip_cli = strtof(optarg, NULL);
+            if (grad_clip_cli < 0.0f) {
+                grad_clip_cli = 0.0f;
+            }
+            break;
         default:
-            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean] [--optimizer sgd|adam] [--adam-beta1 X] [--adam-beta2 X] [--adam-eps X] [--weight-decay X] [--ema-decay X] [--lr-warmup-steps N] [--lr-warmup-init LR] [--grad-clip X]\n", argv[0]);
             CLEANUP_AND_RETURN(1);
         }
     }
@@ -7756,6 +8412,28 @@ int main(int argc, char **argv)
 
     /* ---------- try allocation ---------- */
     TransformerModel M = {0};
+    ensure_model_header_defaults(&M);
+    if (optimizer_name && strcmp(optimizer_name, "adam") == 0) {
+        M.optimizer = OPTIMIZER_ADAM;
+    } else {
+        M.optimizer = OPTIMIZER_SGD;
+    }
+    M.adam_beta1 = adam_beta1_cli;
+    M.adam_beta2 = adam_beta2_cli;
+    M.adam_eps = adam_eps_cli;
+    M.weight_decay = weight_decay_cli;
+    if (ema_decay_cli > 0.0f) {
+        M.ema_enabled = true;
+        M.ema_decay = ema_decay_cli;
+    } else {
+        M.ema_enabled = false;
+        M.ema_decay = 0.0f;
+    }
+    M.lr_warmup_steps = lr_warmup_steps_cli;
+    M.lr_warmup_init = lr_warmup_init_cli;
+    M.grad_clip = grad_clip_cli;
+    M.optimizer_step = 0;
+    M.optimizer_state_initialized = false;
     
     if (seq_cls_cli_enabled) {
         M.seq_cls_enabled = true;
@@ -7815,10 +8493,6 @@ int main(int argc, char **argv)
         M.kv_cache_capacity = M.context_window;
     }
     
-    if (!weight_file) {
-        ensure_model_header_defaults(&M);
-    }
-
     size_t need_bytes = bytes_needed(M.num_layers, M.vocab_size, M.embed_dim, M.context_window,
                                      M.seq_cls_enabled, M.seq_cls_num_classes);
     double need_gib = need_bytes / (1024.0 * 1024.0 * 1024.0);
