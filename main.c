@@ -4313,6 +4313,7 @@ void gelu_activation_token_parallel(TransformerModel *M, size_t data_offset)
 // MLP (Feed-Forward Network) - Two GEMM operations
 // ================================================================
 void mlp_token_parallel(TransformerModel *M,
+                        int layer_idx,
                         size_t input_offset,
                         size_t fc1_weight_offset,
                         size_t fc1_bias_offset,
@@ -4342,8 +4343,26 @@ void mlp_token_parallel(TransformerModel *M,
         }
     }
 
+    // If training, cache FC1 pre-GELU activations for backward_gelu
+    if (M->training_enabled && M->gradients.layers && layer_idx >= 0) {
+        LayerGradients *LG = &M->gradients.layers[layer_idx];
+        float *dst_fc1 = M->memory_base + LG->fc1_output_copy_offset;
+        memcpy(dst_fc1,
+               M->memory_base + fc1_output_offset,
+               (size_t)M->context_window * 4 * M->aligned_embed_dim * sizeof(float));
+    }
+
     // Apply GELU activation in-place
     gelu_activation_token_parallel(M, fc1_output_offset);
+
+    // If training, cache FC2 input (post-GELU activations) for backward_fc2
+    if (M->training_enabled && M->gradients.layers && layer_idx >= 0) {
+        LayerGradients *LG = &M->gradients.layers[layer_idx];
+        float *dst_fc2_in = M->memory_base + LG->fc2_input_copy_offset;
+        memcpy(dst_fc2_in,
+               M->memory_base + fc1_output_offset,
+               (size_t)M->context_window * 4 * M->aligned_embed_dim * sizeof(float));
+    }
 
     // FC2: project back to original dimension
 #pragma omp parallel num_threads(M->num_cores)
@@ -4681,7 +4700,7 @@ void transformer_layer_forward(TransformerModel *M, int layer_idx, size_t layer_
                              L->ln2_bias_offset, L->ln2_mean_offset, L->ln2_rstd_offset, L->ln2_output_offset, eps);
 
     // 7. MLP (Feed-Forward)
-    mlp_token_parallel(M, L->ln2_output_offset, L->fc1_weight_offset, L->fc1_bias_offset,
+    mlp_token_parallel(M, layer_idx, L->ln2_output_offset, L->fc1_weight_offset, L->fc1_bias_offset,
                        L->fc1_output_offset, L->fc2_weight_offset, L->fc2_bias_offset,
                        L->mlp_output_offset);
 
@@ -5483,7 +5502,7 @@ void cache_forward_activations(TransformerModel *M) {
         LayerGradients *LG = &M->gradients.layers[l];
         TrulyOptimalLayer *L = &M->layers[l];
         
-        // Layer outputs
+        // Layer outputs (RES2)
         memcpy(M->memory_base + LG->residual2_copy_offset,
                M->memory_base + L->residual2_output_offset,
                M->context_window * M->aligned_embed_dim * sizeof(float));
@@ -5509,7 +5528,15 @@ void cache_forward_activations(TransformerModel *M) {
                M->memory_base + L->v_output_offset,
                M->num_attention_heads * M->context_window * M->aligned_head_dim * sizeof(float));
         
-        // LayerNorm outputs and stats
+        // LayerNorm1 inputs, outputs, and stats
+        const float *ln1_input_src =
+            (l == 0)
+                ? (M->memory_base + M->embedded_input_offset)
+                : (M->memory_base + M->layers[l - 1].residual2_output_offset);
+        memcpy(M->memory_base + LG->ln1_input_copy_offset,
+               ln1_input_src,
+               M->context_window * M->aligned_embed_dim * sizeof(float));
+        
         memcpy(M->memory_base + LG->ln1_output_copy_offset,
                M->memory_base + L->ln1_output_offset,
                M->context_window * M->aligned_embed_dim * sizeof(float));
@@ -5522,7 +5549,48 @@ void cache_forward_activations(TransformerModel *M) {
                M->memory_base + L->ln1_rstd_offset,
                M->context_window * sizeof(float));
         
-        // Continue for MLP activations...
+        memcpy(M->memory_base + LG->ln1_gamma_copy_offset,
+               M->memory_base + L->ln1_weight_offset,
+               M->aligned_embed_dim * sizeof(float));
+        
+        memcpy(M->memory_base + LG->ln1_beta_copy_offset,
+               M->memory_base + L->ln1_bias_offset,
+               M->aligned_embed_dim * sizeof(float));
+        
+        // Residual1 (input to LN2)
+        memcpy(M->memory_base + LG->residual1_copy_offset,
+               M->memory_base + L->residual1_output_offset,
+               M->context_window * M->aligned_embed_dim * sizeof(float));
+        
+        // LayerNorm2 inputs/outputs and stats
+        memcpy(M->memory_base + LG->ln2_input_copy_offset,
+               M->memory_base + L->residual1_output_offset,
+               M->context_window * M->aligned_embed_dim * sizeof(float));
+        
+        memcpy(M->memory_base + LG->ln2_output_copy_offset,
+               M->memory_base + L->ln2_output_offset,
+               M->context_window * M->aligned_embed_dim * sizeof(float));
+        
+        memcpy(M->memory_base + LG->ln2_mean_copy_offset,
+               M->memory_base + L->ln2_mean_offset,
+               M->context_window * sizeof(float));
+        
+        memcpy(M->memory_base + LG->ln2_rstd_copy_offset,
+               M->memory_base + L->ln2_rstd_offset,
+               M->context_window * sizeof(float));
+        
+        memcpy(M->memory_base + LG->ln2_gamma_copy_offset,
+               M->memory_base + L->ln2_weight_offset,
+               M->aligned_embed_dim * sizeof(float));
+        
+        memcpy(M->memory_base + LG->ln2_beta_copy_offset,
+               M->memory_base + L->ln2_bias_offset,
+               M->aligned_embed_dim * sizeof(float));
+        
+        // MLP output
+        memcpy(M->memory_base + LG->mlp_output_copy_offset,
+               M->memory_base + L->mlp_output_offset,
+               M->context_window * M->aligned_embed_dim * sizeof(float));
     }
 }
 
