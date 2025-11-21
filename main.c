@@ -7529,11 +7529,40 @@ static void debug_forward_dump_layer_output(TransformerModel *M,
 
     int last_pos = prompt_len - 1;
     TrulyOptimalLayer *L = &M->layers[layer_idx];
+
+    // LN1 output
+    float *ln1_out = M->memory_base + L->ln1_output_offset +
+                     (size_t)last_pos * M->aligned_embed_dim;
+    printf("🧪 Debug layer %d internal states for last token (position=%d):\n",
+           layer_idx, last_pos);
+    for (int d = 0; d < M->embed_dim; ++d) {
+        printf("LAYER_LN1 layer=%d idx=%d value=%.9g\n", layer_idx, d, ln1_out[d]);
+    }
+
+    // First residual (after attention)
+    float *res1_out = M->memory_base + L->residual1_output_offset +
+                      (size_t)last_pos * M->aligned_embed_dim;
+    for (int d = 0; d < M->embed_dim; ++d) {
+        printf("LAYER_RES1 layer=%d idx=%d value=%.9g\n", layer_idx, d, res1_out[d]);
+    }
+
+    // LN2 output
+    float *ln2_out = M->memory_base + L->ln2_output_offset +
+                     (size_t)last_pos * M->aligned_embed_dim;
+    for (int d = 0; d < M->embed_dim; ++d) {
+        printf("LAYER_LN2 layer=%d idx=%d value=%.9g\n", layer_idx, d, ln2_out[d]);
+    }
+
+    // MLP output (pre second residual)
+    float *mlp_out = M->memory_base + L->mlp_output_offset +
+                     (size_t)last_pos * M->aligned_embed_dim;
+    for (int d = 0; d < M->embed_dim; ++d) {
+        printf("LAYER_MLP layer=%d idx=%d value=%.9g\n", layer_idx, d, mlp_out[d]);
+    }
+
+    // Final residual2 output (layer output)
     float *hidden = M->memory_base + L->residual2_output_offset +
                     (size_t)last_pos * M->aligned_embed_dim;
-
-    printf("🧪 Debug hidden state after layer %d for last token (position=%d):\n",
-           layer_idx, last_pos);
     for (int d = 0; d < M->embed_dim; ++d) {
         printf("LAYER_HIDDEN layer=%d idx=%d value=%.9g\n", layer_idx, d, hidden[d]);
     }

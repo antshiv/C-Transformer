@@ -17,3 +17,9 @@ gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
 
 ./validate_all.sh "Hello World" gpt2_bump.weights ./main 20 0
 
+  python3 validate_layer_stages.py "Hello World" \
+    --layer 0 \
+    --weights gpt2_bump.weights \
+    --executable ./main
+
+
