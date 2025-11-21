@@ -7680,6 +7680,9 @@ static void debug_backward_dump_grads_lm(TransformerModel *M,
     M->task_type = TASK_LM;
     M->active_tokens = ctx_len;
 
+    // ===== RESET GRADIENT STATE =====
+    zero_gradients(M);
+
     // ===== FORWARD =====
     embed_tokens(M, input_tokens, ctx_len);
 
@@ -7704,7 +7707,6 @@ static void debug_backward_dump_grads_lm(TransformerModel *M,
     compute_cross_entropy_loss(M, target_tokens, ctx_len, &loss);
 
     // ===== BACKWARD =====
-    zero_gradients(M);
     cache_forward_activations(M);
     backward_lm_head(M);
     backward_final_layernorm(M);
@@ -7977,6 +7979,11 @@ float training_step(TransformerModel *M,
     bool lm_task = (M->task_type == TASK_LM);
     bool seq_task = (M->task_type == TASK_SEQ_CLS) && M->seq_cls_enabled;
     
+    // ======== BACKWARD STATE RESET ========
+    // Zero all gradient accumulators at the start of the step so that
+    // gradients from this batch are not contaminated by previous steps.
+    zero_gradients(M);
+
     // ======== FORWARD PASS ========
     embed_tokens(M, input_tokens, ctx_len);
     
@@ -8014,7 +8021,6 @@ float training_step(TransformerModel *M,
     }
     
     // ======== BACKWARD PASS ========
-    zero_gradients(M);
     cache_forward_activations(M);
     
     if (lm_task) {
