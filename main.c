@@ -7836,6 +7836,13 @@ static void debug_backward_dump_grads_lm(TransformerModel *M,
         printf("GRAD final_ln_beta idx=%d value=%.9g\n", i, d_final_beta[i]);
     }
 
+    // Final LayerNorm input gradient (dL/d input to ln_f), first 16 elements
+    float *d_final_ln_input = M->memory_base + M->gradients.d_final_ln_input_offset;
+    int max_print_final_in = (D < 16) ? D : 16;
+    for (int i = 0; i < max_print_final_in; ++i) {
+        printf("GRAD final_ln_input idx=%d value=%.9g\n", i, d_final_ln_input[i]);
+    }
+
     // Layer-specific gradients (proj, MLP, LN1/LN2) as a representative layer
     if (M->num_layers > 0 && M->gradients.layers) {
         if (layer_idx < 0) layer_idx = 0;

@@ -91,12 +91,13 @@ def run_c_debug_backward(
     # Example lines:
     # DEBUG_BACKWARD loss=2.345
     # GRAD final_ln_gamma idx=0 value=...
-    # GRAD final_ln_beta idx=0 value=...
+    # GRAD final_ln_beta  idx=0 value=...
+    # GRAD final_ln_input idx=0 value=...
     # GRAD ln1_gamma layer=0 idx=0 value=...
     # GRAD proj_weight layer=0 idx=0 value=...
     loss_pat = re.compile(r"DEBUG_BACKWARD\s+loss=([\-0-9.eE]+)")
     grad_simple_pat = re.compile(
-        r"GRAD\s+(final_ln_gamma|final_ln_beta)\s+idx=(\d+)\s+value=([\-0-9.eE]+)"
+        r"GRAD\s+(final_ln_gamma|final_ln_beta|final_ln_input)\s+idx=(\d+)\s+value=([\-0-9.eE]+)"
     )
     grad_layer_pat = re.compile(
         r"GRAD\s+(ln1_gamma|ln1_beta|ln2_gamma|ln2_beta|proj_weight|fc1_weight|fc2_weight)\s+layer=(\d+)\s+idx=(\d+)\s+value=([\-0-9.eE]+)"
@@ -194,6 +195,15 @@ def main():
     import torch
     model.zero_grad(set_to_none=True)
     input_ids = torch.tensor([token_ids], dtype=torch.long)
+    # Hook to capture grad w.r.t final LayerNorm input
+    hook_vals = {}
+
+    def ln_f_hook(module, grad_input, grad_output):
+        # grad_input[0] is dL/d(input), shape [1, T, D]
+        hook_vals["ln_f_grad_input"] = grad_input[0].detach().cpu()
+
+    handle = model.transformer.ln_f.register_full_backward_hook(ln_f_hook)
+
     logits = model(input_ids).logits  # [1, T, V]
     T = logits.size(1)
 
@@ -202,6 +212,7 @@ def main():
     loss_terms = -log_probs[0, torch.arange(T), targets[0]]  # [T]
     loss_hf = loss_terms.mean()
     loss_hf.backward()
+    handle.remove()
 
     print(f"\nHF loss (eval): {loss_hf.item():.9g}  |  C loss: {loss_c:.9g}")
 
@@ -260,9 +271,15 @@ def main():
             return None
         return param.grad.detach().cpu().numpy().astype("float32").reshape(-1)
 
+    def flatten_tensor(t):
+        if t is None:
+            return None
+        return t.detach().cpu().numpy().astype("float32").reshape(-1)
+
     # final_ln_gamma / beta (ln_f)
     ln_f_gamma = flatten_grad(model.transformer.ln_f.weight)
     ln_f_beta = flatten_grad(model.transformer.ln_f.bias)
+    ln_f_input_grad = flatten_tensor(hook_vals.get("ln_f_grad_input"))
 
     # Transformer block selected for per-layer comparisons
     layer_idx = args.layer
@@ -286,6 +303,7 @@ def main():
     hf_map = {
         "final_ln_gamma": ln_f_gamma,
         "final_ln_beta": ln_f_beta,
+        "final_ln_input": ln_f_input_grad,
         f"ln1_gamma_{key_layer}": ln1_gamma,
         f"ln1_beta_{key_layer}": ln1_beta,
         f"ln2_gamma_{key_layer}": ln2_gamma,
@@ -343,6 +361,7 @@ def main():
     # Compare the slices we printed in C
     compare_grad("final_ln_gamma", "final_ln_gamma")
     compare_grad("final_ln_beta", "final_ln_beta")
+    compare_grad("final_ln_input", "final_ln_input")
     compare_grad(f"ln1_gamma_{key_layer}", f"ln1_gamma_{key_layer}")
     compare_grad(f"ln1_beta_{key_layer}", f"ln1_beta_{key_layer}")
     compare_grad(f"ln2_gamma_{key_layer}", f"ln2_gamma_{key_layer}")
