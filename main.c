@@ -3778,18 +3778,32 @@ void test_attention_head_major_after_qkv(TransformerModel *M) {
 
 /**
  * @brief Production attention projection with concat: Head-major → Token-major → GEMM
- * 
+ *
  * This function implements the concat strategy that proved 3.2x faster than
  * direct head-major projection on hyperthreaded systems.
- * 
+ *
  * @param M Transformer model
  * @param layer_idx Layer index to process
- * 
- * Memory flow:
- * 1. Input: Head-major attention [head][token][head_dim]
- * 2. Concat: Convert to token-major contiguous [token][embed_dim] 
- * 3. GEMM: Standard matrix multiplication (proven 100 GFLOPS)
- * 4. Output: Token-major projection result [token][embed_dim]
+ *
+ * Memory flow (important for understanding residual usage):
+ *
+ *  - Input  (read-only):
+ *      L->attention_output_offset
+ *        = head-major attention tensor  [head][token][head_dim]
+ *
+ *  - Scratch (temporary):
+ *      L->residual1_output_offset
+ *        = used here as a concat buffer for the projected heads in
+ *          token-major layout [token][embed_dim]
+ *
+ *  - Output of c_proj (before residual add):
+ *      L->residual2_output_offset
+ *        = token-major projection result [token][embed_dim]
+ *
+ * Later in transformer_layer_forward, we do:
+ *      RES1 = h_in + (data at residual2_output_offset)
+ * and write that sum to residual1_output_offset. After the MLP block,
+ * residual2_output_offset is reused to hold the final layer output RES2.
  */
 void attention_projection_with_concat(TransformerModel *M, int layer_idx) {
     TrulyOptimalLayer *L = &M->layers[layer_idx];
@@ -4610,6 +4624,25 @@ void transformer_layer_forward(TransformerModel *M, int layer_idx, size_t layer_
 {
     TrulyOptimalLayer *L = &M->layers[layer_idx];
     const float eps = 1e-5f;
+
+    // NOTE ON BUFFER ROLES IN THIS FUNCTION:
+    //
+    //   layer_input_offset        : h_in  (input to this block)
+    //   L->ln1_output_offset      : ln1   (pre-attention LayerNorm output)
+    //   L->attention_output_offset: head-major attention output (per-head, pre-projection)
+    //   L->residual2_output_offset: used in two phases:
+    //       (a) immediately after attention_projection_with_concat ->
+    //           holds c_proj(attn) in token-major layout
+    //       (b) after the MLP + second residual ->
+    //           holds the final block output RES2
+    //   L->residual1_output_offset: always holds RES1 = h_in + c_proj(attn)
+    //
+    // Historically we used attention_output_offset directly in the first
+    // residual add; that was incorrect, because it skipped the projection
+    // (c_proj) and added head-major data to h_in. The current wiring fixes
+    // that by:
+    //   1) projecting head-major attention into residual2_output_offset, then
+    //   2) forming RES1 = h_in + projected_attn into residual1_output_offset.
 
     // 1. Pre-attention LayerNorm
     layernorm_token_parallel(M, layer_input_offset, L->ln1_weight_offset,
@@ -7606,6 +7639,149 @@ static void debug_forward_dump_layer_output(TransformerModel *M,
     }
 }
 
+static void debug_backward_dump_grads_lm(TransformerModel *M,
+                                         int32_t *prompt,
+                                         int prompt_len) {
+    if (!M->training_enabled) {
+        fprintf(stderr, "❌ debug_backward_dump_grads_lm: training buffers not allocated (training_enabled=false).\n");
+        return;
+    }
+    if (!prompt || prompt_len <= 0) {
+        fprintf(stderr, "❌ debug_backward_dump_grads_lm: empty prompt.\n");
+        return;
+    }
+
+    int ctx_len = prompt_len;
+    if (ctx_len <= 0 || ctx_len > M->context_window) {
+        ctx_len = M->context_window;
+    }
+
+    // Build local input/target tokens (LM: predict same token at each position)
+    int32_t input_tokens[1024];
+    int32_t target_tokens[1024];
+    int max_ctx = (M->context_window < 1024) ? M->context_window : 1024;
+    if (ctx_len > max_ctx) {
+        ctx_len = max_ctx;
+    }
+    memset(input_tokens, 0, sizeof(input_tokens));
+    memset(target_tokens, 0, sizeof(target_tokens));
+    for (int i = 0; i < ctx_len; ++i) {
+        input_tokens[i] = prompt[i];
+        target_tokens[i] = prompt[i];
+    }
+
+    // Cache tokens for backward_embedding_layer
+    int32_t *token_cache = (int32_t *)(M->memory_base + M->gradients.actual_tokens_offset);
+    memcpy(token_cache, input_tokens, ctx_len * sizeof(int32_t));
+    if (ctx_len < M->context_window) {
+        memset(token_cache + ctx_len, 0, (M->context_window - ctx_len) * sizeof(int32_t));
+    }
+
+    M->task_type = TASK_LM;
+    M->active_tokens = ctx_len;
+
+    // ===== FORWARD =====
+    embed_tokens(M, input_tokens, ctx_len);
+
+    size_t current_input = M->embedded_input_offset;
+    for (int layer = 0; layer < M->num_layers; layer++) {
+        transformer_layer_forward(M, layer, current_input);
+        current_input = M->layers[layer].residual2_output_offset;
+    }
+
+    layernorm_token_parallel(M, current_input,
+                             M->final_ln_weight_offset,
+                             M->final_ln_bias_offset,
+                             M->final_ln_mean_offset,
+                             M->final_ln_rstd_offset,
+                             M->final_output_offset, 1e-5f);
+
+    for (int t = 0; t < ctx_len; t++) {
+        compute_logits_last_token_optimized(M, t);
+    }
+
+    float loss = 0.0f;
+    compute_cross_entropy_loss(M, target_tokens, ctx_len, &loss);
+
+    // ===== BACKWARD =====
+    zero_gradients(M);
+    cache_forward_activations(M);
+    backward_lm_head(M);
+    backward_final_layernorm(M);
+    for (int layer = M->num_layers - 1; layer >= 0; layer--) {
+        backward_transformer_layer(M, layer);
+    }
+    backward_embedding_layer(M);
+
+    printf("DEBUG_BACKWARD loss=%.9g\n", loss);
+
+    // Dump a few key gradients for comparison with HF.
+    int D = M->aligned_embed_dim;
+
+    // Final LayerNorm gamma/beta
+    float *d_final_gamma = M->memory_base + M->gradients.d_final_ln_gamma_offset;
+    float *d_final_beta = M->memory_base + M->gradients.d_final_ln_beta_offset;
+    int max_print_ln = (D < 16) ? D : 16;
+    for (int i = 0; i < max_print_ln; ++i) {
+        printf("GRAD final_ln_gamma idx=%d value=%.9g\n", i, d_final_gamma[i]);
+    }
+    for (int i = 0; i < max_print_ln; ++i) {
+        printf("GRAD final_ln_beta idx=%d value=%.9g\n", i, d_final_beta[i]);
+    }
+
+    // Layer 0 gradients (proj, MLP, LN1/LN2) as a representative layer
+    if (M->num_layers > 0 && M->gradients.layers) {
+        TrulyOptimalLayer *L0 = &M->layers[0];
+        LayerGradients *LG0 = &M->gradients.layers[0];
+
+        // LN1 gamma/beta
+        float *d_ln1_gamma = M->memory_base + LG0->d_ln1_gamma_offset;
+        float *d_ln1_beta  = M->memory_base + LG0->d_ln1_beta_offset;
+        for (int i = 0; i < max_print_ln; ++i) {
+            printf("GRAD ln1_gamma layer=0 idx=%d value=%.9g\n", i, d_ln1_gamma[i]);
+        }
+        for (int i = 0; i < max_print_ln; ++i) {
+            printf("GRAD ln1_beta layer=0 idx=%d value=%.9g\n", i, d_ln1_beta[i]);
+        }
+
+        // LN2 gamma/beta
+        float *d_ln2_gamma = M->memory_base + LG0->d_ln2_gamma_offset;
+        float *d_ln2_beta  = M->memory_base + LG0->d_ln2_beta_offset;
+        for (int i = 0; i < max_print_ln; ++i) {
+            printf("GRAD ln2_gamma layer=0 idx=%d value=%.9g\n", i, d_ln2_gamma[i]);
+        }
+        for (int i = 0; i < max_print_ln; ++i) {
+            printf("GRAD ln2_beta layer=0 idx=%d value=%.9g\n", i, d_ln2_beta[i]);
+        }
+
+        // Attention projection weights (c_proj equivalent): [D × D]
+        float *d_proj_w = M->memory_base + LG0->d_proj_weights_offset;
+        int max_print_proj = 32;
+        int proj_elems = D * D;
+        int limit_proj = (proj_elems < max_print_proj) ? proj_elems : max_print_proj;
+        for (int i = 0; i < limit_proj; ++i) {
+            printf("GRAD proj_weight layer=0 idx=%d value=%.9g\n", i, d_proj_w[i]);
+        }
+
+        // MLP FC1 weights: [D × 4D]
+        float *d_fc1_w = M->memory_base + LG0->d_fc1_weights_offset;
+        int fc_dim = 4 * D;
+        int fc1_elems = D * fc_dim;
+        int limit_fc1 = (fc1_elems < max_print_proj) ? fc1_elems : max_print_proj;
+        for (int i = 0; i < limit_fc1; ++i) {
+            printf("GRAD fc1_weight layer=0 idx=%d value=%.9g\n", i, d_fc1_w[i]);
+        }
+
+        // MLP FC2 weights: [4D × D]
+        float *d_fc2_w = M->memory_base + LG0->d_fc2_weights_offset;
+        int fc2_elems = fc_dim * D;
+        int limit_fc2 = (fc2_elems < max_print_proj) ? fc2_elems : max_print_proj;
+        for (int i = 0; i < limit_fc2; ++i) {
+            printf("GRAD fc2_weight layer=0 idx=%d value=%.9g\n", i, d_fc2_w[i]);
+        }
+    }
+}
+
 static bool shuffle_training_pairs(TrainingPairList *list);
 
 static bool preload_all_training_windows(const TrainingPairList *list,
@@ -8533,6 +8709,7 @@ int main(int argc, char **argv)
     int debug_hidden = 0;
     int debug_embed = 0;
     int debug_layer = -1;
+    int debug_backward = 0;
     int debug_top_k = 10;
 
 #define CLEANUP_AND_RETURN(code)                     \
@@ -8577,6 +8754,7 @@ int main(int argc, char **argv)
         {"debug-hidden", no_argument, 0, 1020},
         {"debug-embed", no_argument, 0, 1021},
         {"debug-layer", required_argument, 0, 1022},
+        {"debug-backward", no_argument, 0, 1023},
         {0, 0, 0, 0}
     };
 
@@ -8696,6 +8874,9 @@ int main(int argc, char **argv)
         case 1022:
             debug_layer = atoi(optarg);
             break;
+        case 1023:
+            debug_backward = 1;
+            break;
         default:
             fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean] [--optimizer sgd|adam] [--adam-beta1 X] [--adam-beta2 X] [--adam-eps X] [--weight-decay X] [--ema-decay X] [--lr-warmup-steps N] [--lr-warmup-init LR] [--grad-clip X] [--debug-logits] [--debug-top-k N] [--debug-hidden] [--debug-embed] [--debug-layer L]\n", argv[0]);
             CLEANUP_AND_RETURN(1);
@@ -8806,6 +8987,12 @@ int main(int argc, char **argv)
         printf("📚 Training dataset: %zu windows (caching %zu inside arena)\n",
                dataset_pairs, cache_samples);
         M.kv_cache_enabled = false;
+    } else if (debug_backward) {
+        // Enable gradient storage even when not running the full training loop.
+        // This allows a one-off forward+backward step for numerical validation.
+        M.training_enabled = true;
+        M.training_cache_samples = 0;
+        M.kv_cache_enabled = true;
     } else {
         M.training_cache_samples = 0;
         M.kv_cache_enabled = true;
@@ -8948,6 +9135,17 @@ int main(int argc, char **argv)
                 int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
                 printf("⚠️  No prompt provided, using default: \"Hello, I am\" for debug embed\n");
                 debug_forward_dump_embed(&M, default_prompt, 4);
+            }
+        } else if (debug_backward) {
+            printf("\n🧪 Debug mode: backward LM gradient dump\n");
+            if (!M.training_enabled) {
+                printf("❌ Training buffers not allocated; enable training mode for backward debug.\n");
+            } else if (prompt_length > 0) {
+                debug_backward_dump_grads_lm(&M, prompt_tokens, prompt_length);
+            } else {
+                int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
+                printf("⚠️  No prompt provided, using default: \"Hello, I am\" for debug backward\n");
+                debug_backward_dump_grads_lm(&M, default_prompt, 4);
             }
         } else if (debug_layer >= 0) {
             printf("\n🧪 Debug mode: dumping hidden state after layer %d\n", debug_layer);
