@@ -7560,6 +7560,28 @@ static void debug_forward_dump_layer_output(TransformerModel *M,
         printf("  Q[%d]=%.9g K[%d]=%.9g V[%d]=%.9g\n", d, q, d, k, d, v);
     }
 
+    // Attention scores (softmax probabilities) for head 0, last token
+    if (L->attention_scores_offset != 0 && M->aligned_attn_context_window > 0) {
+        float *attn_scores = M->memory_base + L->attention_scores_offset;
+        int aligned_ctx = (int)M->aligned_attn_context_window;
+        printf("LAYER_ATTNSCORES layer=%d token=%d head=0:\n", layer_idx, last_pos);
+        for (int j = 0; j <= last_pos; ++j) {
+            float p = ATTN_SCORES_ACCESS(attn_scores, 0, last_pos, j, aligned_ctx);
+            printf("  ATTNSCORE j=%d value=%.9g\n", j, p);
+        }
+    }
+
+    // Attention output for head 0, last token (before projection)
+    if (L->attention_output_offset != 0) {
+        float *attn_out = M->memory_base + L->attention_output_offset;
+        int head_dim = M->head_dim;
+        printf("LAYER_ATTNOUT layer=%d token=%d head=0:\n", layer_idx, last_pos);
+        for (int d = 0; d < head_dim; ++d) {
+            float val = Q_ACCESS(attn_out, 0, last_pos, d, M->context_window, M->aligned_head_dim);
+            printf("  ATTN_OUT idx=%d value=%.9g\n", d, val);
+        }
+    }
+
     // LN2 output
     float *ln2_out = M->memory_base + L->ln2_output_offset +
                      (size_t)last_pos * M->aligned_embed_dim;
