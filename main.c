@@ -3464,6 +3464,7 @@ void apply_causal_softmax_head_major(
     float *attn_scores = M->memory_base + L->attention_scores_offset;
     const int num_heads = M->num_attention_heads;
     const int num_tokens = M->context_window;
+    const int aligned_context_window = M->aligned_attn_context_window;
     
     // printf("Applying causal softmax for %d heads...\n", num_heads);
 
@@ -3471,30 +3472,30 @@ void apply_causal_softmax_head_major(
     for (int h = 0; h < num_heads; ++h) {
         for (int i = 0; i < num_tokens; ++i) {
             // Find max for numerical stability (only over valid positions j <= i)
-            float max_val = ATTN_SCORES_ACCESS(attn_scores, h, i, 0, num_tokens);
+            float max_val = ATTN_SCORES_ACCESS(attn_scores, h, i, 0, aligned_context_window);
             for (int j = 1; j <= i; ++j) {
-                float score = ATTN_SCORES_ACCESS(attn_scores, h, i, j, num_tokens);
+                float score = ATTN_SCORES_ACCESS(attn_scores, h, i, j, aligned_context_window);
                 if (score > max_val) max_val = score;
             }
             
             // Compute exp(score - max) and sum (only for j <= i)
             float sum = 0.0f;
             for (int j = 0; j <= i; ++j) {
-                float score = ATTN_SCORES_ACCESS(attn_scores, h, i, j, num_tokens);
+                float score = ATTN_SCORES_ACCESS(attn_scores, h, i, j, aligned_context_window);
                 float exp_score = expf(score - max_val);
-                ATTN_SCORES_ACCESS(attn_scores, h, i, j, num_tokens) = exp_score;
+                ATTN_SCORES_ACCESS(attn_scores, h, i, j, aligned_context_window) = exp_score;
                 sum += exp_score;
             }
             
             // Normalize (only for j <= i)
             float inv_sum = 1.0f / sum;
             for (int j = 0; j <= i; ++j) {
-                ATTN_SCORES_ACCESS(attn_scores, h, i, j, num_tokens) *= inv_sum;
+                ATTN_SCORES_ACCESS(attn_scores, h, i, j, aligned_context_window) *= inv_sum;
             }
             
             // Set upper triangle to 0 (j > i) - though we won't use these
             for (int j = i + 1; j < num_tokens; ++j) {
-                ATTN_SCORES_ACCESS(attn_scores, h, i, j, num_tokens) = 0.0f;
+                ATTN_SCORES_ACCESS(attn_scores, h, i, j, aligned_context_window) = 0.0f;
             }
         }
     }
@@ -3518,6 +3519,7 @@ void compute_attention_output_head_major(
     const int num_tokens = M->context_window;
     const int head_dim = M->head_dim;
     const int aligned_head_dim = M->aligned_head_dim;
+    const int aligned_context_window = M->aligned_attn_context_window;
     
     // printf("Computing attention output (Softmax·V) for %d heads...\n", num_heads);
 
@@ -3530,8 +3532,8 @@ void compute_attention_output_head_major(
             }
             
             // Accumulate weighted sum: output[h,i,:] = Σ(j=0 to i) scores[h,i,j] * V[h,j,:]
-            for (int j = 0; j <= i; ++j) {  // Only sum over causal positions
-                float weight = ATTN_SCORES_ACCESS(attn_scores, h, i, j, num_tokens);
+                for (int j = 0; j <= i; ++j) {  // Only sum over causal positions
+                    float weight = ATTN_SCORES_ACCESS(attn_scores, h, i, j, aligned_context_window);
                 
                 // Vectorized accumulation
                 int d;
