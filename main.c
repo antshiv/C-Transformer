@@ -5286,6 +5286,104 @@ void generate(TransformerModel* M, int* prompt, int prompt_len, int max_tokens) 
     }
 }
 
+static void debug_forward_dump_logits(TransformerModel *M,
+                                      int32_t *prompt,
+                                      int prompt_len,
+                                      int top_k) {
+    if (!prompt || prompt_len <= 0) {
+        fprintf(stderr, "❌ debug_forward_dump_logits: empty prompt.\n");
+        return;
+    }
+    if (top_k <= 0) {
+        top_k = 10;
+    }
+    if (top_k > 50) {
+        top_k = 50;
+    }
+
+    if (prompt_len > M->context_window) {
+        prompt_len = M->context_window;
+    }
+
+    // Copy prompt into a local context buffer
+    int32_t context[1024];
+    int max_ctx = (M->context_window < 1024) ? M->context_window : 1024;
+    if (prompt_len > max_ctx) {
+        prompt_len = max_ctx;
+    }
+    memset(context, 0, sizeof(context));
+    for (int i = 0; i < prompt_len; ++i) {
+        context[i] = prompt[i];
+    }
+
+    // Forward pass (no sampling)
+    embed_tokens(M, context, prompt_len);
+
+    size_t current_input = M->embedded_input_offset;
+    for (int layer = 0; layer < M->num_layers; layer++) {
+        transformer_layer_forward(M, layer, current_input);
+        current_input = M->layers[layer].residual2_output_offset;
+    }
+
+    layernorm_token_parallel(M, current_input,
+                             M->final_ln_weight_offset,
+                             M->final_ln_bias_offset,
+                             M->final_ln_mean_offset,
+                             M->final_ln_rstd_offset,
+                             M->final_output_offset, 1e-5f);
+
+    // Compute logits for last token in the prompt
+    int last_pos = prompt_len - 1;
+    compute_logits_last_token_optimized(M, last_pos);
+
+    float *logits = M->memory_base + M->logits_offset +
+                    (size_t)last_pos * M->vocab_size;
+    int vocab = M->vocab_size;
+
+    // Track top_k indices by logit value
+    int top_indices[50];
+    int top_count = 0;
+
+    for (int v = 0; v < vocab; ++v) {
+        float val = logits[v];
+        if (top_count < top_k) {
+            top_indices[top_count++] = v;
+        } else {
+            // Find current minimum in top_k
+            int min_idx = 0;
+            float min_val = logits[top_indices[0]];
+            for (int i = 1; i < top_count; ++i) {
+                float cur = logits[top_indices[i]];
+                if (cur < min_val) {
+                    min_val = cur;
+                    min_idx = i;
+                }
+            }
+            if (val > min_val) {
+                top_indices[min_idx] = v;
+            }
+        }
+    }
+
+    // Simple insertion sort on top_k indices by logit descending
+    for (int i = 1; i < top_count; ++i) {
+        int idx = top_indices[i];
+        float val = logits[idx];
+        int j = i - 1;
+        while (j >= 0 && logits[top_indices[j]] < val) {
+            top_indices[j + 1] = top_indices[j];
+            --j;
+        }
+        top_indices[j + 1] = idx;
+    }
+
+    printf("🧪 Debug logits for last token (position=%d):\n", last_pos);
+    for (int i = 0; i < top_count; ++i) {
+        int idx = top_indices[i];
+        printf("LOGIT idx=%d value=%.6f\n", idx, logits[idx]);
+    }
+}
+
 /******************  BACKWARD PASS ***************************/
 
 void zero_gradients(TransformerModel *M) {
@@ -7313,6 +7411,11 @@ static inline float compute_scheduled_lr(const TransformerModel *M,
                                          float base_lr,
                                          int step_index);
 
+static void debug_forward_dump_logits(TransformerModel *M,
+                                      int32_t *prompt,
+                                      int prompt_len,
+                                      int top_k);
+
 static bool shuffle_training_pairs(TrainingPairList *list);
 
 static bool preload_all_training_windows(const TrainingPairList *list,
@@ -8236,6 +8339,8 @@ int main(int argc, char **argv)
     int lr_warmup_steps_cli = 0;
     float lr_warmup_init_cli = 0.0f;
     float grad_clip_cli = 0.0f;
+    int debug_logits = 0;
+    int debug_top_k = 10;
 
 #define CLEANUP_AND_RETURN(code)                     \
     do {                                             \
@@ -8274,6 +8379,8 @@ int main(int argc, char **argv)
         {"lr-warmup-steps", required_argument, 0, 1015},
         {"lr-warmup-init", required_argument, 0, 1016},
         {"grad-clip", required_argument, 0, 1017},
+        {"debug-logits", no_argument, 0, 1018},
+        {"debug-top-k", required_argument, 0, 1019},
         {0, 0, 0, 0}
     };
 
@@ -8375,8 +8482,17 @@ int main(int argc, char **argv)
                 grad_clip_cli = 0.0f;
             }
             break;
+        case 1018:
+            debug_logits = 1;
+            break;
+        case 1019:
+            debug_top_k = atoi(optarg);
+            if (debug_top_k <= 0) {
+                debug_top_k = 10;
+            }
+            break;
         default:
-            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean] [--optimizer sgd|adam] [--adam-beta1 X] [--adam-beta2 X] [--adam-eps X] [--weight-decay X] [--ema-decay X] [--lr-warmup-steps N] [--lr-warmup-init LR] [--grad-clip X]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean] [--optimizer sgd|adam] [--adam-beta1 X] [--adam-beta2 X] [--adam-eps X] [--weight-decay X] [--ema-decay X] [--lr-warmup-steps N] [--lr-warmup-init LR] [--grad-clip X] [--debug-logits] [--debug-top-k N]\n", argv[0]);
             CLEANUP_AND_RETURN(1);
         }
     }
@@ -8601,14 +8717,25 @@ int main(int argc, char **argv)
     }
 
     if (weight_file && !train_dir) {
-        printf("\n🚀 Generating text...\n");
-        
-        if (prompt_length > 0) {
-            generate(&M, prompt_tokens, prompt_length, 20);
+        if (debug_logits) {
+            printf("\n🧪 Debug mode: dumping logits for last token\n");
+            if (prompt_length > 0) {
+                debug_forward_dump_logits(&M, prompt_tokens, prompt_length, debug_top_k);
+            } else {
+                int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
+                printf("⚠️  No prompt provided, using default: \"Hello, I am\" for debug logits\n");
+                debug_forward_dump_logits(&M, default_prompt, 4, debug_top_k);
+            }
         } else {
-            int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
-            printf("⚠️  No prompt provided, using default: \"Hello, I am\"\n");
-            generate(&M, default_prompt, 4, 20);
+            printf("\n🚀 Generating text...\n");
+            
+            if (prompt_length > 0) {
+                generate(&M, prompt_tokens, prompt_length, 20);
+            } else {
+                int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
+                printf("⚠️  No prompt provided, using default: \"Hello, I am\"\n");
+                generate(&M, default_prompt, 4, 20);
+            }
         }
     }
 
