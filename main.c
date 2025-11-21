@@ -4619,6 +4619,22 @@ void transformer_layer_forward(TransformerModel *M, int layer_idx, size_t layer_
     qkv_projection_head_major(M, layer_idx);
     kv_cache_store_layer(M, layer_idx, M->kv_cache_tokens);
 
+    // Debug: Print Q, K, V values for last token of head 0
+    if (M->debug_layer >= 0 && layer_idx == M->debug_layer) {
+        int last_tok = M->active_tokens - 1;
+        float *q_base = M->memory_base + L->q_output_offset;
+        float *k_base = M->memory_base + L->k_output_offset;
+        float *v_base = M->memory_base + L->v_output_offset;
+
+        printf("DEBUG_QKV token=%d head=0:\n", last_tok);
+        for (int d = 0; d < 5; d++) {
+            float q = Q_ACCESS(q_base, 0, last_tok, d, M->context_window, M->aligned_head_dim);
+            float k = K_ACCESS(k_base, 0, last_tok, d, M->context_window, M->aligned_head_dim);
+            float v = K_ACCESS(v_base, 0, last_tok, d, M->context_window, M->aligned_head_dim);
+            printf("  Q[%d]=%.6f K[%d]=%.6f V[%d]=%.6f\n", d, q, d, k, d, v);
+        }
+    }
+
     // 3. Attention Computation
     attention_head_major_complete(M, layer_idx);
 
@@ -7546,6 +7562,18 @@ static void debug_forward_dump_layer_output(TransformerModel *M,
                       (size_t)last_pos * M->aligned_embed_dim;
     for (int d = 0; d < M->embed_dim; ++d) {
         printf("LAYER_RES1 layer=%d idx=%d value=%.9g\n", layer_idx, d, res1_out[d]);
+    }
+
+    // QKV outputs for first head (head 0) - first 5 dimensions only
+    float *q_base = M->memory_base + L->q_output_offset;
+    float *k_base = M->memory_base + L->k_output_offset;
+    float *v_base = M->memory_base + L->v_output_offset;
+    printf("LAYER_QKV layer=%d token=%d head=0 (first 5 dims):\n", layer_idx, last_pos);
+    for (int d = 0; d < 5; d++) {
+        float q = Q_ACCESS(q_base, 0, last_pos, d, M->context_window, M->aligned_head_dim);
+        float k = K_ACCESS(k_base, 0, last_pos, d, M->context_window, M->aligned_head_dim);
+        float v = K_ACCESS(v_base, 0, last_pos, d, M->context_window, M->aligned_head_dim);
+        printf("  Q[%d]=%.9g K[%d]=%.9g V[%d]=%.9g\n", d, q, d, k, d, v);
     }
 
     // LN2 output
