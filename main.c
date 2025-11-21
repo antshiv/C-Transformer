@@ -7416,6 +7416,54 @@ static void debug_forward_dump_logits(TransformerModel *M,
                                       int prompt_len,
                                       int top_k);
 
+static void debug_forward_dump_hidden(TransformerModel *M,
+                                      int32_t *prompt,
+                                      int prompt_len) {
+    if (!prompt || prompt_len <= 0) {
+        fprintf(stderr, "❌ debug_forward_dump_hidden: empty prompt.\n");
+        return;
+    }
+
+    int max_ctx = (M->context_window < 1024) ? M->context_window : 1024;
+    if (prompt_len > max_ctx) {
+        prompt_len = max_ctx;
+    }
+
+    int32_t context[1024];
+    memset(context, 0, sizeof(context));
+    for (int i = 0; i < prompt_len; ++i) {
+        context[i] = prompt[i];
+    }
+
+    // Forward pass up to final normalized output
+    embed_tokens(M, context, prompt_len);
+
+    size_t current_input = M->embedded_input_offset;
+    for (int layer = 0; layer < M->num_layers; layer++) {
+        transformer_layer_forward(M, layer, current_input);
+        current_input = M->layers[layer].residual2_output_offset;
+    }
+
+    layernorm_token_parallel(M, current_input,
+                             M->final_ln_weight_offset,
+                             M->final_ln_bias_offset,
+                             M->final_ln_mean_offset,
+                             M->final_ln_rstd_offset,
+                             M->final_output_offset, 1e-5f);
+
+    int last_pos = prompt_len - 1;
+    float *hidden = M->memory_base + M->final_output_offset +
+                    (size_t)last_pos * M->aligned_embed_dim;
+
+    printf("🧪 Debug hidden state for last token (position=%d):\n", last_pos);
+    for (int d = 0; d < M->embed_dim; ++d) {
+        printf("HIDDEN idx=%d value=%.9g\n", d, hidden[d]);
+    }
+}
+static void debug_forward_dump_hidden(TransformerModel *M,
+                                      int32_t *prompt,
+                                      int prompt_len);
+
 static bool shuffle_training_pairs(TrainingPairList *list);
 
 static bool preload_all_training_windows(const TrainingPairList *list,
@@ -8340,6 +8388,7 @@ int main(int argc, char **argv)
     float lr_warmup_init_cli = 0.0f;
     float grad_clip_cli = 0.0f;
     int debug_logits = 0;
+    int debug_hidden = 0;
     int debug_top_k = 10;
 
 #define CLEANUP_AND_RETURN(code)                     \
@@ -8381,6 +8430,7 @@ int main(int argc, char **argv)
         {"grad-clip", required_argument, 0, 1017},
         {"debug-logits", no_argument, 0, 1018},
         {"debug-top-k", required_argument, 0, 1019},
+        {"debug-hidden", no_argument, 0, 1020},
         {0, 0, 0, 0}
     };
 
@@ -8491,8 +8541,11 @@ int main(int argc, char **argv)
                 debug_top_k = 10;
             }
             break;
+        case 1020:
+            debug_hidden = 1;
+            break;
         default:
-            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean] [--optimizer sgd|adam] [--adam-beta1 X] [--adam-beta2 X] [--adam-eps X] [--weight-decay X] [--ema-decay X] [--lr-warmup-steps N] [--lr-warmup-init LR] [--grad-clip X] [--debug-logits] [--debug-top-k N]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean] [--optimizer sgd|adam] [--adam-beta1 X] [--adam-beta2 X] [--adam-eps X] [--weight-decay X] [--ema-decay X] [--lr-warmup-steps N] [--lr-warmup-init LR] [--grad-clip X] [--debug-logits] [--debug-top-k N] [--debug-hidden]\n", argv[0]);
             CLEANUP_AND_RETURN(1);
         }
     }
@@ -8725,6 +8778,15 @@ int main(int argc, char **argv)
                 int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
                 printf("⚠️  No prompt provided, using default: \"Hello, I am\" for debug logits\n");
                 debug_forward_dump_logits(&M, default_prompt, 4, debug_top_k);
+            }
+        } else if (debug_hidden) {
+            printf("\n🧪 Debug mode: dumping hidden state for last token\n");
+            if (prompt_length > 0) {
+                debug_forward_dump_hidden(&M, prompt_tokens, prompt_length);
+            } else {
+                int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
+                printf("⚠️  No prompt provided, using default: \"Hello, I am\" for debug hidden\n");
+                debug_forward_dump_hidden(&M, default_prompt, 4);
             }
         } else {
             printf("\n🚀 Generating text...\n");

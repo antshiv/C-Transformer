@@ -7,6 +7,7 @@ docs/man/
 docs/rtf/
 docs/xml/
 tmp/
+main
 # Keep these files (they're source, not generated):
 # docs/*.md
 # Doxyfile

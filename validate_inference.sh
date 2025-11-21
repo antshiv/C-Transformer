@@ -33,5 +33,5 @@ python3 validate_vs_pytorch.py "$PROMPT" \
   --weights "$WEIGHTS" \
   --executable "$EXECUTABLE" \
   --top-k "$TOP_K" \
-  --save-csv "validation_${TOP_K}_topk.csv"
-
+  --save-csv "validation_${TOP_K}_topk.csv" \
+  --compare-hidden
