@@ -7460,9 +7460,38 @@ static void debug_forward_dump_hidden(TransformerModel *M,
         printf("HIDDEN idx=%d value=%.9g\n", d, hidden[d]);
     }
 }
-static void debug_forward_dump_hidden(TransformerModel *M,
-                                      int32_t *prompt,
-                                      int prompt_len);
+
+static void debug_forward_dump_embed(TransformerModel *M,
+                                     int32_t *prompt,
+                                     int prompt_len) {
+    if (!prompt || prompt_len <= 0) {
+        fprintf(stderr, "❌ debug_forward_dump_embed: empty prompt.\n");
+        return;
+    }
+
+    int max_ctx = (M->context_window < 1024) ? M->context_window : 1024;
+    if (prompt_len > max_ctx) {
+        prompt_len = max_ctx;
+    }
+
+    int32_t context[1024];
+    memset(context, 0, sizeof(context));
+    for (int i = 0; i < prompt_len; ++i) {
+        context[i] = prompt[i];
+    }
+
+    // Compute embedded inputs only
+    embed_tokens(M, context, prompt_len);
+
+    printf("🧪 Debug embedded inputs (token + position):\n");
+    for (int t = 0; t < prompt_len; ++t) {
+        float *vec = M->memory_base + M->embedded_input_offset +
+                     (size_t)t * M->aligned_embed_dim;
+        for (int d = 0; d < M->embed_dim; ++d) {
+            printf("EMBED t=%d idx=%d value=%.9g\n", t, d, vec[d]);
+        }
+    }
+}
 
 static bool shuffle_training_pairs(TrainingPairList *list);
 
@@ -8389,6 +8418,7 @@ int main(int argc, char **argv)
     float grad_clip_cli = 0.0f;
     int debug_logits = 0;
     int debug_hidden = 0;
+    int debug_embed = 0;
     int debug_top_k = 10;
 
 #define CLEANUP_AND_RETURN(code)                     \
@@ -8431,6 +8461,7 @@ int main(int argc, char **argv)
         {"debug-logits", no_argument, 0, 1018},
         {"debug-top-k", required_argument, 0, 1019},
         {"debug-hidden", no_argument, 0, 1020},
+        {"debug-embed", no_argument, 0, 1021},
         {0, 0, 0, 0}
     };
 
@@ -8544,8 +8575,11 @@ int main(int argc, char **argv)
         case 1020:
             debug_hidden = 1;
             break;
+        case 1021:
+            debug_embed = 1;
+            break;
         default:
-            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean] [--optimizer sgd|adam] [--adam-beta1 X] [--adam-beta2 X] [--adam-eps X] [--weight-decay X] [--ema-decay X] [--lr-warmup-steps N] [--lr-warmup-init LR] [--grad-clip X] [--debug-logits] [--debug-top-k N] [--debug-hidden]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean] [--optimizer sgd|adam] [--adam-beta1 X] [--adam-beta2 X] [--adam-eps X] [--weight-decay X] [--ema-decay X] [--lr-warmup-steps N] [--lr-warmup-init LR] [--grad-clip X] [--debug-logits] [--debug-top-k N] [--debug-hidden] [--debug-embed]\n", argv[0]);
             CLEANUP_AND_RETURN(1);
         }
     }
@@ -8787,6 +8821,15 @@ int main(int argc, char **argv)
                 int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
                 printf("⚠️  No prompt provided, using default: \"Hello, I am\" for debug hidden\n");
                 debug_forward_dump_hidden(&M, default_prompt, 4);
+            }
+        } else if (debug_embed) {
+            printf("\n🧪 Debug mode: dumping embedded inputs (token + position)\n");
+            if (prompt_length > 0) {
+                debug_forward_dump_embed(&M, prompt_tokens, prompt_length);
+            } else {
+                int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
+                printf("⚠️  No prompt provided, using default: \"Hello, I am\" for debug embed\n");
+                debug_forward_dump_embed(&M, default_prompt, 4);
             }
         } else {
             printf("\n🚀 Generating text...\n");
