@@ -7493,6 +7493,52 @@ static void debug_forward_dump_embed(TransformerModel *M,
     }
 }
 
+static void debug_forward_dump_layer_output(TransformerModel *M,
+                                            int32_t *prompt,
+                                            int prompt_len,
+                                            int layer_idx) {
+    if (!prompt || prompt_len <= 0) {
+        fprintf(stderr, "❌ debug_forward_dump_layer_output: empty prompt.\n");
+        return;
+    }
+    if (layer_idx < 0 || layer_idx >= M->num_layers) {
+        fprintf(stderr, "❌ debug_forward_dump_layer_output: invalid layer index %d (num_layers=%d)\n",
+                layer_idx, M->num_layers);
+        return;
+    }
+
+    int max_ctx = (M->context_window < 1024) ? M->context_window : 1024;
+    if (prompt_len > max_ctx) {
+        prompt_len = max_ctx;
+    }
+
+    int32_t context[1024];
+    memset(context, 0, sizeof(context));
+    for (int i = 0; i < prompt_len; ++i) {
+        context[i] = prompt[i];
+    }
+
+    // Forward up to the requested layer (inclusive)
+    embed_tokens(M, context, prompt_len);
+
+    size_t current_input = M->embedded_input_offset;
+    for (int layer = 0; layer <= layer_idx; ++layer) {
+        transformer_layer_forward(M, layer, current_input);
+        current_input = M->layers[layer].residual2_output_offset;
+    }
+
+    int last_pos = prompt_len - 1;
+    TrulyOptimalLayer *L = &M->layers[layer_idx];
+    float *hidden = M->memory_base + L->residual2_output_offset +
+                    (size_t)last_pos * M->aligned_embed_dim;
+
+    printf("🧪 Debug hidden state after layer %d for last token (position=%d):\n",
+           layer_idx, last_pos);
+    for (int d = 0; d < M->embed_dim; ++d) {
+        printf("LAYER_HIDDEN layer=%d idx=%d value=%.9g\n", layer_idx, d, hidden[d]);
+    }
+}
+
 static bool shuffle_training_pairs(TrainingPairList *list);
 
 static bool preload_all_training_windows(const TrainingPairList *list,
@@ -8419,6 +8465,7 @@ int main(int argc, char **argv)
     int debug_logits = 0;
     int debug_hidden = 0;
     int debug_embed = 0;
+    int debug_layer = -1;
     int debug_top_k = 10;
 
 #define CLEANUP_AND_RETURN(code)                     \
@@ -8462,6 +8509,7 @@ int main(int argc, char **argv)
         {"debug-top-k", required_argument, 0, 1019},
         {"debug-hidden", no_argument, 0, 1020},
         {"debug-embed", no_argument, 0, 1021},
+        {"debug-layer", required_argument, 0, 1022},
         {0, 0, 0, 0}
     };
 
@@ -8578,8 +8626,11 @@ int main(int argc, char **argv)
         case 1021:
             debug_embed = 1;
             break;
+        case 1022:
+            debug_layer = atoi(optarg);
+            break;
         default:
-            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean] [--optimizer sgd|adam] [--adam-beta1 X] [--adam-beta2 X] [--adam-eps X] [--weight-decay X] [--ema-decay X] [--lr-warmup-steps N] [--lr-warmup-init LR] [--grad-clip X] [--debug-logits] [--debug-top-k N] [--debug-hidden] [--debug-embed]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean] [--optimizer sgd|adam] [--adam-beta1 X] [--adam-beta2 X] [--adam-eps X] [--weight-decay X] [--ema-decay X] [--lr-warmup-steps N] [--lr-warmup-init LR] [--grad-clip X] [--debug-logits] [--debug-top-k N] [--debug-hidden] [--debug-embed] [--debug-layer L]\n", argv[0]);
             CLEANUP_AND_RETURN(1);
         }
     }
@@ -8830,6 +8881,15 @@ int main(int argc, char **argv)
                 int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
                 printf("⚠️  No prompt provided, using default: \"Hello, I am\" for debug embed\n");
                 debug_forward_dump_embed(&M, default_prompt, 4);
+            }
+        } else if (debug_layer >= 0) {
+            printf("\n🧪 Debug mode: dumping hidden state after layer %d\n", debug_layer);
+            if (prompt_length > 0) {
+                debug_forward_dump_layer_output(&M, prompt_tokens, prompt_length, debug_layer);
+            } else {
+                int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
+                printf("⚠️  No prompt provided, using default: \"Hello, I am\" for debug layer output\n");
+                debug_forward_dump_layer_output(&M, default_prompt, 4, debug_layer);
             }
         } else {
             printf("\n🚀 Generating text...\n");
