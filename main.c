@@ -3815,7 +3815,9 @@ void attention_projection_with_concat(TransformerModel *M, int layer_idx) {
     const float *proj_weights = M->memory_base + L->proj_weight_offset;
     const float *proj_bias = M->memory_base + L->proj_bias_offset;
     
-    // Temporary concatenation buffer (reuse residual1 space to save memory)
+    // Temporary concatenation buffer (reuse residual1 space to save memory).
+    // When training_enabled, we also treat this as the token-major
+    // attention output buffer needed for backward_attention_projection.
     float *concat_buffer = M->memory_base + L->residual1_output_offset;
     
     // Final output (use residual2 space - this becomes input to next layer)
@@ -3863,6 +3865,16 @@ void attention_projection_with_concat(TransformerModel *M, int layer_idx) {
     // Use proven GEMM kernel with full threading for compute-bound operation
     gemm_fine_grained_parallel(concat_buffer, proj_weights, proj_bias, 
                                final_output, M->context_window, M->embed_dim, M->embed_dim);
+
+    // If gradients are allocated, stash the token-major attention output
+    // (concat_buffer) into the gradient arena for use in backward_attention_projection.
+    if (M->training_enabled && M->gradients.layers) {
+        LayerGradients *LG = &M->gradients.layers[layer_idx];
+        float *attn_token_copy = M->memory_base + LG->attention_output_copy_offset;
+        memcpy(attn_token_copy,
+               concat_buffer,
+               M->context_window * M->aligned_embed_dim * sizeof(float));
+    }
 }
 
 // ============================================================================
@@ -5476,10 +5488,13 @@ void cache_forward_activations(TransformerModel *M) {
                M->memory_base + L->residual2_output_offset,
                M->context_window * M->aligned_embed_dim * sizeof(float));
         
-        // Attention outputs (token-major [T × D])
-        memcpy(M->memory_base + LG->attention_output_copy_offset,
-               M->memory_base + L->attention_output_offset,
-               M->context_window * M->aligned_embed_dim * sizeof(float));
+        // Attention outputs:
+        // For the head-major attention stack, the token-major attention
+        // buffer used for projection is produced inside
+        // attention_projection_with_concat() and written directly into
+        // LG->attention_output_copy_offset when training_enabled=true.
+        // We no longer copy from L->attention_output_offset here, as that
+        // tensor is head-major and not suitable for backward_attention_projection.
         
         // QKV outputs
         memcpy(M->memory_base + LG->q_output_copy_offset,
