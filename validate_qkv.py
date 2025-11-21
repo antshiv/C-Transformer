@@ -91,11 +91,11 @@ def run_c_debug_qkv(
         print(result.stderr)
         sys.exit(1)
 
-    # Example output:
-    #   DEBUG_QKV token=1 head=0:
+    # Example output from debug_forward_dump_layer_output:
+    #   LAYER_QKV layer=0 token=1 head=0 (first 5 dims):
     #     Q[0]=... K[0]=... V[0]=...
     #     Q[1]=... K[1]=... V[1]=...
-    token_pat = re.compile(r"DEBUG_QKV token=(\d+)\s+head=0")
+    token_pat = re.compile(r"LAYER_QKV\s+layer=(\d+)\s+token=(\d+)\s+head=0")
     row_pat = re.compile(
         r"Q\[(\d+)\]=([\-0-9.eE]+)\s+K\[\1\]=([\-0-9.eE]+)\s+V\[\1\]=([\-0-9.eE]+)"
     )
@@ -108,7 +108,11 @@ def run_c_debug_qkv(
     for line in result.stdout.splitlines():
         m_tok = token_pat.search(line)
         if m_tok:
-            last_token_idx = int(m_tok.group(1))
+            layer = int(m_tok.group(1))
+            if layer != layer_idx:
+                # Ignore QKV dumps from other layers (if any)
+                continue
+            last_token_idx = int(m_tok.group(2))
             continue
 
         m_row = row_pat.search(line)
@@ -259,4 +263,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
