@@ -32,3 +32,7 @@ gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
     --weights gpt2_bump.weights \
     --executable ./main
 
+  python3 validate_backward.py "Hello World" \
+    --weights gpt2_bump.weights \
+    --executable ./main
+
