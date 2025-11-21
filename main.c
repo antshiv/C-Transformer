@@ -5512,8 +5512,10 @@ void cache_forward_activations(TransformerModel *M) {
         // buffer used for projection is produced inside
         // attention_projection_with_concat() and written directly into
         // LG->attention_output_copy_offset when training_enabled=true.
-        // We no longer copy from L->attention_output_offset here, as that
-        // tensor is head-major and not suitable for backward_attention_projection.
+        // Separately, we cache the softmax probabilities from the aligned
+        // attention_scores buffer into attention_weights_copy_offset in a
+        // compact [H×T×T] layout for backward_attention_weighted_values
+        // and backward_causal_softmax.
         
         // QKV outputs
         memcpy(M->memory_base + LG->q_output_copy_offset,
@@ -5527,6 +5529,25 @@ void cache_forward_activations(TransformerModel *M) {
         memcpy(M->memory_base + LG->v_output_copy_offset,
                M->memory_base + L->v_output_offset,
                M->num_attention_heads * M->context_window * M->aligned_head_dim * sizeof(float));
+
+        // Attention softmax probabilities: copy from the aligned
+        // [H×aligned_T×aligned_T] buffer into a compact [H×T×T] buffer.
+        {
+            float *scores = M->memory_base + L->attention_scores_offset;
+            float *attn_cache = M->memory_base + LG->attention_weights_copy_offset;
+            int H = M->num_attention_heads;
+            int T = M->context_window;
+            int aligned_T = (int)M->aligned_attn_context_window;
+
+            for (int h = 0; h < H; ++h) {
+                for (int i = 0; i < T; ++i) {
+                    for (int j = 0; j < T; ++j) {
+                        float v = ATTN_SCORES_ACCESS(scores, h, i, j, aligned_T);
+                        ATTN_ACCESS(attn_cache, h, i, j, T) = v;
+                    }
+                }
+            }
+        }
         
         // LayerNorm1 inputs, outputs, and stats
         const float *ln1_input_src =
