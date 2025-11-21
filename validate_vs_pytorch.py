@@ -32,6 +32,8 @@ def load_tokenizer_and_model(model_name: str):
 
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     model = GPT2LMHeadModel.from_pretrained(model_name)
+    # Ensure we get hidden_states in the output for validation
+    model.config.output_hidden_states = True
     model.eval()
     model.to("cpu")
     return tokenizer, model
@@ -189,7 +191,12 @@ def main():
     with torch.no_grad():
         outputs = model(input_ids)
         hf_logits = outputs.logits[0, -1, :]  # last position
-        hf_hidden = outputs.last_hidden_state[0, -1, :]  # final hidden for last token
+        # GPT2LMHeadModel returns hidden_states when output_hidden_states=True
+        # Use the last hidden state tensor from hidden_states
+        if outputs.hidden_states is None:
+            print("❌ Model did not return hidden_states; ensure output_hidden_states=True.")
+            sys.exit(1)
+        hf_hidden = outputs.hidden_states[-1][0, -1, :]  # final hidden for last token
 
     # Compute HF top-K
     top_k = min(args.top_k, hf_logits.numel())
