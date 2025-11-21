@@ -7656,7 +7656,8 @@ static void debug_forward_dump_layer_output(TransformerModel *M,
 
 static void debug_backward_dump_grads_lm(TransformerModel *M,
                                          int32_t *prompt,
-                                         int prompt_len) {
+                                         int prompt_len,
+                                         int layer_idx) {
     if (!M->training_enabled) {
         fprintf(stderr, "❌ debug_backward_dump_grads_lm: training buffers not allocated (training_enabled=false).\n");
         return;
@@ -7746,29 +7747,31 @@ static void debug_backward_dump_grads_lm(TransformerModel *M,
         printf("GRAD final_ln_beta idx=%d value=%.9g\n", i, d_final_beta[i]);
     }
 
-    // Layer 0 gradients (proj, MLP, LN1/LN2) as a representative layer
+    // Layer-specific gradients (proj, MLP, LN1/LN2) as a representative layer
     if (M->num_layers > 0 && M->gradients.layers) {
-        TrulyOptimalLayer *L0 = &M->layers[0];
-        LayerGradients *LG0 = &M->gradients.layers[0];
+        if (layer_idx < 0) layer_idx = 0;
+        if (layer_idx >= M->num_layers) layer_idx = M->num_layers - 1;
+        TrulyOptimalLayer *L0 = &M->layers[layer_idx];
+        LayerGradients *LG0 = &M->gradients.layers[layer_idx];
 
         // LN1 gamma/beta
         float *d_ln1_gamma = M->memory_base + LG0->d_ln1_gamma_offset;
         float *d_ln1_beta  = M->memory_base + LG0->d_ln1_beta_offset;
         for (int i = 0; i < max_print_ln; ++i) {
-            printf("GRAD ln1_gamma layer=0 idx=%d value=%.9g\n", i, d_ln1_gamma[i]);
+            printf("GRAD ln1_gamma layer=%d idx=%d value=%.9g\n", layer_idx, i, d_ln1_gamma[i]);
         }
         for (int i = 0; i < max_print_ln; ++i) {
-            printf("GRAD ln1_beta layer=0 idx=%d value=%.9g\n", i, d_ln1_beta[i]);
+            printf("GRAD ln1_beta layer=%d idx=%d value=%.9g\n", layer_idx, i, d_ln1_beta[i]);
         }
 
         // LN2 gamma/beta
         float *d_ln2_gamma = M->memory_base + LG0->d_ln2_gamma_offset;
         float *d_ln2_beta  = M->memory_base + LG0->d_ln2_beta_offset;
         for (int i = 0; i < max_print_ln; ++i) {
-            printf("GRAD ln2_gamma layer=0 idx=%d value=%.9g\n", i, d_ln2_gamma[i]);
+            printf("GRAD ln2_gamma layer=%d idx=%d value=%.9g\n", layer_idx, i, d_ln2_gamma[i]);
         }
         for (int i = 0; i < max_print_ln; ++i) {
-            printf("GRAD ln2_beta layer=0 idx=%d value=%.9g\n", i, d_ln2_beta[i]);
+            printf("GRAD ln2_beta layer=%d idx=%d value=%.9g\n", layer_idx, i, d_ln2_beta[i]);
         }
 
         // Attention projection weights (c_proj equivalent): [D × D]
@@ -7777,7 +7780,7 @@ static void debug_backward_dump_grads_lm(TransformerModel *M,
         int proj_elems = D * D;
         int limit_proj = (proj_elems < max_print_proj) ? proj_elems : max_print_proj;
         for (int i = 0; i < limit_proj; ++i) {
-            printf("GRAD proj_weight layer=0 idx=%d value=%.9g\n", i, d_proj_w[i]);
+            printf("GRAD proj_weight layer=%d idx=%d value=%.9g\n", layer_idx, i, d_proj_w[i]);
         }
 
         // MLP FC1 weights: [D × 4D]
@@ -7786,7 +7789,7 @@ static void debug_backward_dump_grads_lm(TransformerModel *M,
         int fc1_elems = D * fc_dim;
         int limit_fc1 = (fc1_elems < max_print_proj) ? fc1_elems : max_print_proj;
         for (int i = 0; i < limit_fc1; ++i) {
-            printf("GRAD fc1_weight layer=0 idx=%d value=%.9g\n", i, d_fc1_w[i]);
+            printf("GRAD fc1_weight layer=%d idx=%d value=%.9g\n", layer_idx, i, d_fc1_w[i]);
         }
 
         // MLP FC2 weights: [4D × D]
@@ -7794,8 +7797,19 @@ static void debug_backward_dump_grads_lm(TransformerModel *M,
         int fc2_elems = fc_dim * D;
         int limit_fc2 = (fc2_elems < max_print_proj) ? fc2_elems : max_print_proj;
         for (int i = 0; i < limit_fc2; ++i) {
-            printf("GRAD fc2_weight layer=0 idx=%d value=%.9g\n", i, d_fc2_w[i]);
+            printf("GRAD fc2_weight layer=%d idx=%d value=%.9g\n", layer_idx, i, d_fc2_w[i]);
         }
+    }
+
+    // Embedding / LM head weight tying gradients: print a small slice
+    float *d_embed_weights = M->memory_base + M->gradients.d_embed_weights_offset;
+    int embed_D = M->aligned_embed_dim;
+    int vocab = M->vocab_size;
+    int max_embed_print = 32;
+    int total_embed = vocab * embed_D;
+    int limit_embed = (total_embed < max_embed_print) ? total_embed : max_embed_print;
+    for (int i = 0; i < limit_embed; ++i) {
+        printf("GRAD embed_weight idx=%d value=%.9g\n", i, d_embed_weights[i]);
     }
 }
 
@@ -9162,11 +9176,13 @@ int main(int argc, char **argv)
             if (!M.training_enabled) {
                 printf("❌ Training buffers not allocated; enable training mode for backward debug.\n");
             } else if (prompt_length > 0) {
-                debug_backward_dump_grads_lm(&M, prompt_tokens, prompt_length);
+                int layer_idx = (debug_layer >= 0) ? debug_layer : (M.num_layers > 0 ? M.num_layers - 1 : 0);
+                debug_backward_dump_grads_lm(&M, prompt_tokens, prompt_length, layer_idx);
             } else {
                 int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
+                int layer_idx = (debug_layer >= 0) ? debug_layer : (M.num_layers > 0 ? M.num_layers - 1 : 0);
                 printf("⚠️  No prompt provided, using default: \"Hello, I am\" for debug backward\n");
-                debug_backward_dump_grads_lm(&M, default_prompt, 4);
+                debug_backward_dump_grads_lm(&M, default_prompt, 4, layer_idx);
             }
         } else if (debug_layer >= 0) {
             printf("\n🧪 Debug mode: dumping hidden state after layer %d\n", debug_layer);

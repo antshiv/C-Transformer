@@ -33,7 +33,8 @@ def load_tokenizer_and_model(model_name: str):
 
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     model = GPT2LMHeadModel.from_pretrained(model_name)
-    model.train()
+    # Use eval() to match C (no dropout), but gradients still flow.
+    model.eval()
     model.to("cpu")
     return tokenizer, model
 
@@ -42,6 +43,7 @@ def run_c_debug_backward(
     executable: str,
     weights: str,
     token_ids: List[int],
+    layer_idx: int,
 ) -> Tuple[float, Dict[str, Dict[int, float]]]:
     """
     Run the C binary with --debug-backward and parse gradients.
@@ -59,6 +61,8 @@ def run_c_debug_backward(
         "--force",
         "--debug-backward",
     ]
+    if layer_idx >= 0:
+        cmd.extend(["--debug-layer", str(layer_idx)])
     print("▶ Running C binary for backward debug:")
     print("  ", " ".join(cmd))
 
@@ -97,6 +101,9 @@ def run_c_debug_backward(
     grad_layer_pat = re.compile(
         r"GRAD\s+(ln1_gamma|ln1_beta|ln2_gamma|ln2_beta|proj_weight|fc1_weight|fc2_weight)\s+layer=(\d+)\s+idx=(\d+)\s+value=([\-0-9.eE]+)"
     )
+    grad_embed_pat = re.compile(
+        r"GRAD\s+embed_weight\s+idx=(\d+)\s+value=([\-0-9.eE]+)"
+    )
 
     for line in result.stdout.splitlines():
         m_loss = loss_pat.search(line)
@@ -122,6 +129,13 @@ def run_c_debug_backward(
             grads.setdefault(key, {})[idx] = val
             continue
 
+        m_ge = grad_embed_pat.search(line)
+        if m_ge:
+            idx = int(m_ge.group(1))
+            val = float(m_ge.group(2))
+            grads.setdefault("embed_weight", {})[idx] = val
+            continue
+
     if loss_c is None:
         print("❌ Failed to parse DEBUG_BACKWARD loss from C output.")
         print("=== STDOUT ===")
@@ -137,6 +151,12 @@ def main():
     parser.add_argument("--weights", default="gpt2_bump.weights", help="Path to C weight file")
     parser.add_argument("--executable", default="./main", help="Path to C binary")
     parser.add_argument("--model-name", default="gpt2", help="HuggingFace model name (default: gpt2)")
+    parser.add_argument(
+        "--layer",
+        type=int,
+        default=-1,
+        help="Transformer block index to validate grads for (default: last layer)",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.weights):
@@ -162,13 +182,16 @@ def main():
     print(f"📝 Prompt: {args.text}")
     print(f"   Tokens: {token_ids}")
 
-    # C side
-    loss_c, grads_c = run_c_debug_backward(args.executable, args.weights, token_ids)
+    # C side: backward debug for chosen layer
+    loss_c, grads_c = run_c_debug_backward(
+        args.executable, args.weights, token_ids, args.layer
+    )
 
-    # HF side: run same LM loss (no shift) and backprop
+    # HF side: forward+loss+backward with same loss definition
     import torch
     import numpy as np
 
+    import torch
     model.zero_grad(set_to_none=True)
     input_ids = torch.tensor([token_ids], dtype=torch.long)
     logits = model(input_ids).logits  # [1, T, V]
@@ -180,7 +203,56 @@ def main():
     loss_hf = loss_terms.mean()
     loss_hf.backward()
 
-    print(f"\nHF loss: {loss_hf.item():.9g}  |  C loss: {loss_c:.9g}")
+    print(f"\nHF loss (eval): {loss_hf.item():.9g}  |  C loss: {loss_c:.9g}")
+
+    # Optional: forward logits check on last token (top-10)
+    try:
+        import numpy as np
+
+        from math import isfinite
+
+        last_t = T - 1
+        c_logits = None
+        # Run C debug-logits for the same prompt to compare logits
+        tokens_str = ",".join(str(t) for t in token_ids)
+        cmd_logits = [
+            args.executable,
+            "--weights",
+            args.weights,
+            "--prompt",
+            tokens_str,
+            "--force",
+            "--debug-logits",
+            "--debug-top-k",
+            "10",
+        ]
+        res_log = subprocess.run(cmd_logits, capture_output=True, text=True, timeout=300)
+        if res_log.returncode == 0:
+            logit_pat = re.compile(r"LOGIT idx=(\d+)\s+value=([\-0-9.eE]+)")
+            vals = {}
+            for line in res_log.stdout.splitlines():
+                m = logit_pat.search(line)
+                if m:
+                    vid = int(m.group(1))
+                    val = float(m.group(2))
+                    if isfinite(val):
+                        vals[vid] = val
+            if vals:
+                c_vocab = max(vals.keys()) + 1
+                c_logits_vec = np.full((c_vocab,), np.nan, dtype="float32")
+                for vid, val in vals.items():
+                    if vid < c_vocab:
+                        c_logits_vec[vid] = val
+                hf_logits_vec = logits[0, last_t].detach().cpu().numpy().astype("float32")
+                dim = min(hf_logits_vec.size, c_logits_vec.size)
+                diff = np.abs(hf_logits_vec[:dim] - c_logits_vec[:dim])
+                print(f"\n📊 Logit comparison (last token, {dim} dims):")
+                print(f"  Max abs diff: {float(diff.max()):.6e}")
+                print(f"  Mean abs diff:{float(diff.mean()):.6e}")
+        else:
+            print("⚠️  C debug-logits run failed; skipping logits comparison.")
+    except Exception as e:
+        print(f"⚠️  Skipping logits comparison due to error: {e}")
 
     # Collect HF grads for the same slices C printed
     def flatten_grad(param):
@@ -192,26 +264,36 @@ def main():
     ln_f_gamma = flatten_grad(model.transformer.ln_f.weight)
     ln_f_beta = flatten_grad(model.transformer.ln_f.bias)
 
-    block0 = model.transformer.h[0]
-    ln1_gamma = flatten_grad(block0.ln_1.weight)
-    ln1_beta = flatten_grad(block0.ln_1.bias)
-    ln2_gamma = flatten_grad(block0.ln_2.weight)
-    ln2_beta = flatten_grad(block0.ln_2.bias)
+    # Transformer block selected for per-layer comparisons
+    layer_idx = args.layer
+    if layer_idx < 0 or layer_idx >= len(model.transformer.h):
+        layer_idx = len(model.transformer.h) - 1
+    block = model.transformer.h[layer_idx]
+    ln1_gamma = flatten_grad(block.ln_1.weight)
+    ln1_beta = flatten_grad(block.ln_1.bias)
+    ln2_gamma = flatten_grad(block.ln_2.weight)
+    ln2_beta = flatten_grad(block.ln_2.bias)
 
-    proj_w = flatten_grad(block0.attn.c_proj.weight)
-    fc1_w = flatten_grad(block0.mlp.c_fc.weight)
-    fc2_w = flatten_grad(block0.mlp.c_proj.weight)
+    proj_w = flatten_grad(block.attn.c_proj.weight)
+    fc1_w = flatten_grad(block.mlp.c_fc.weight)
+    fc2_w = flatten_grad(block.mlp.c_proj.weight)
 
+    # Embedding / LM head grads (weight tying)
+    wte = model.transformer.wte
+    embed_grad = flatten_grad(wte.weight)
+
+    key_layer = f"L{layer_idx}"
     hf_map = {
         "final_ln_gamma": ln_f_gamma,
         "final_ln_beta": ln_f_beta,
-        "ln1_gamma_L0": ln1_gamma,
-        "ln1_beta_L0": ln1_beta,
-        "ln2_gamma_L0": ln2_gamma,
-        "ln2_beta_L0": ln2_beta,
-        "proj_weight_L0": proj_w,
-        "fc1_weight_L0": fc1_w,
-        "fc2_weight_L0": fc2_w,
+        f"ln1_gamma_{key_layer}": ln1_gamma,
+        f"ln1_beta_{key_layer}": ln1_beta,
+        f"ln2_gamma_{key_layer}": ln2_gamma,
+        f"ln2_beta_{key_layer}": ln2_beta,
+        f"proj_weight_{key_layer}": proj_w,
+        f"fc1_weight_{key_layer}": fc1_w,
+        f"fc2_weight_{key_layer}": fc2_w,
+        "embed_weight": embed_grad,
     }
 
     def compare_grad(name_c: str, name_hf: str):
@@ -258,17 +340,18 @@ def main():
                 )
 
     # Compare the slices we printed in C
+    # Compare the slices we printed in C
     compare_grad("final_ln_gamma", "final_ln_gamma")
     compare_grad("final_ln_beta", "final_ln_beta")
-    compare_grad("ln1_gamma_L0", "ln1_gamma_L0")
-    compare_grad("ln1_beta_L0", "ln1_beta_L0")
-    compare_grad("ln2_gamma_L0", "ln2_gamma_L0")
-    compare_grad("ln2_beta_L0", "ln2_beta_L0")
-    compare_grad("proj_weight_L0", "proj_weight_L0")
-    compare_grad("fc1_weight_L0", "fc1_weight_L0")
-    compare_grad("fc2_weight_L0", "fc2_weight_L0")
+    compare_grad(f"ln1_gamma_{key_layer}", f"ln1_gamma_{key_layer}")
+    compare_grad(f"ln1_beta_{key_layer}", f"ln1_beta_{key_layer}")
+    compare_grad(f"ln2_gamma_{key_layer}", f"ln2_gamma_{key_layer}")
+    compare_grad(f"ln2_beta_{key_layer}", f"ln2_beta_{key_layer}")
+    compare_grad(f"proj_weight_{key_layer}", f"proj_weight_{key_layer}")
+    compare_grad(f"fc1_weight_{key_layer}", f"fc1_weight_{key_layer}")
+    compare_grad(f"fc2_weight_{key_layer}", f"fc2_weight_{key_layer}")
+    compare_grad("embed_weight", "embed_weight")
 
 
 if __name__ == "__main__":
     main()
-
