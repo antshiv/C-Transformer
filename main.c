@@ -4622,11 +4622,13 @@ void transformer_layer_forward(TransformerModel *M, int layer_idx, size_t layer_
     // 3. Attention Computation
     attention_head_major_complete(M, layer_idx);
 
-    // 4. Attention Output Projection
+    // 4. Attention Output Projection (head-major → token-major + linear proj)
     attention_projection_with_concat(M, layer_idx);
     
     // 5. First Residual Connection
-    residual_add_token_parallel(M, layer_input_offset, L->attention_output_offset,
+    //    Add the projected attention (token-major, stored at residual2_output_offset)
+    //    back to the layer input to form RES1.
+    residual_add_token_parallel(M, layer_input_offset, L->residual2_output_offset,
                                 L->residual1_output_offset);
 
     // 6. Pre-MLP LayerNorm
