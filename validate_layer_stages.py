@@ -185,6 +185,8 @@ def main():
         # Take last token
         ln1_vec = ln1[0, -1, :].cpu().numpy()
         res1_vec = res1[0, -1, :].cpu().numpy()
+        attn_vec = attn_out[0, -1, :].cpu().numpy()
+        h_in_vec = h_in[0, -1, :].cpu().numpy()
         ln2_vec = ln2[0, -1, :].cpu().numpy()
         mlp_vec = mlp_out[0, -1, :].cpu().numpy()
         res2_vec = res2[0, -1, :].cpu().numpy()
@@ -192,6 +194,7 @@ def main():
     hf_stage_vecs = {
         "ln1": ln1_vec,
         "res1": res1_vec,
+        "attn": attn_vec,
         "ln2": ln2_vec,
         "mlp": mlp_vec,
         "res2": res2_vec,
@@ -236,6 +239,40 @@ def main():
 
     compare_stage("ln1", "ln1")
     compare_stage("res1", "res1")
+
+    # Attention output: derive C attention as RES1 - h_in
+    if "res1" in c_stages:
+        import numpy as np
+
+        c_res1 = np.array(c_stages["res1"], dtype="float32")
+        dim_attn = min(c_res1.size, attn_vec.size, h_in_vec.size)
+        attn_c = c_res1[:dim_attn] - h_in_vec[:dim_attn]
+        diff_attn = np.abs(attn_vec[:dim_attn] - attn_c)
+        max_diff_attn = float(diff_attn.max())
+        mean_diff_attn = float(diff_attn.mean())
+        print(f"\nStage ATTN vs C (derived from RES1 - h_in):")
+        print(f"  Dimension:    {dim_attn}")
+        print(f"  Max abs diff: {max_diff_attn:.6f}")
+        print(f"  Mean abs diff:{mean_diff_attn:.6f}")
+        try:
+            import pandas as pd
+
+            rows = []
+            for i in range(min(dim_attn, 10)):
+                rows.append(
+                    {
+                        "idx": i,
+                        "hf": float(attn_vec[i]),
+                        "c": float(attn_c[i]),
+                        "diff": float(diff_attn[i]),
+                    }
+                )
+            df = pd.DataFrame(rows)
+            print("  Sample (first 10 dims):")
+            print(df.to_string(index=False))
+        except Exception:
+            pass
+
     compare_stage("ln2", "ln2")
     compare_stage("mlp", "mlp")
     compare_stage("res2", "res2")
@@ -243,4 +280,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
