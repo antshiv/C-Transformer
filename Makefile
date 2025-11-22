@@ -20,6 +20,7 @@ TRAIN_STEPS = 10
 TRAIN_LR = 3e-5
 TRAIN_PROMPT = "SELECT * FROM users WHERE age > 10;"
 GEN_TOKENS = 20
+TRAIN_OPTIMIZER = adam
 
 # Python interpreter
 PYTHON = python3
@@ -165,7 +166,7 @@ test-training-step: build
 
 compare-training: build
 	@echo "🎓 Comparing C vs PyTorch training..."
-	@echo "   Steps: $(TRAIN_STEPS), LR: $(TRAIN_LR)"
+	@echo "   Steps: $(TRAIN_STEPS), LR: $(TRAIN_LR), Optimizer: $(TRAIN_OPTIMIZER)"
 	@echo "   Training dir: $(TRAIN_DIR)"
 	$(PYTHON) compare_training_c_vs_pytorch.py \
 		--train-dir $(TRAIN_DIR) \
@@ -175,6 +176,7 @@ compare-training: build
 		--steps $(TRAIN_STEPS) \
 		--lr $(TRAIN_LR) \
 		--log-interval 1 \
+		--optimizer $(TRAIN_OPTIMIZER) \
 		--prompt $(TRAIN_PROMPT) \
 		--gen-tokens $(GEN_TOKENS)
 
@@ -282,4 +284,3 @@ help:
 	@echo "  make validate-backward LAYER=11"
 	@echo "  make compare-training TRAIN_STEPS=20 TRAIN_LR=5e-5"
 	@echo "  make full-test"
-

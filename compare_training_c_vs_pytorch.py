@@ -106,6 +106,7 @@ def run_c_training(
     steps: int,
     lr: float,
     log_interval: int,
+    optimizer_name: str,
 ) -> List[Tuple[int, float]]:
     """
     Run the C binary for a short training loop and parse [train] losses.
@@ -132,7 +133,7 @@ def run_c_training(
         "--ckpt-interval",
         str(steps),
         "--optimizer",
-        "adam",
+        optimizer_name,
         "--force",
     ]
     print("▶ Running C training:", " ".join(cmd))
@@ -250,6 +251,7 @@ def run_pytorch_training(
     steps: int,
     lr: float,
     log_interval: int,
+    optimizer_name: str,
 ) -> tuple[List[Tuple[int, float]], torch.nn.Module]:
     """
     Run a short PyTorch GPT-2 training loop on the same windows and objective
@@ -267,7 +269,11 @@ def run_pytorch_training(
         sys.exit(1)
 
     model = load_model(model_name)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    if optimizer_name.lower() == "sgd":
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+    else:
+        # Default to AdamW for "adam" or anything else
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
     losses: List[Tuple[int, float]] = []
     step = 0
@@ -342,6 +348,12 @@ def main():
         help="Log every N steps (default: 10)",
     )
     parser.add_argument(
+        "--optimizer",
+        default="adam",
+        choices=["adam", "sgd"],
+        help="Optimizer to use for both C and PyTorch runs (adam or sgd, default: adam).",
+    )
+    parser.add_argument(
         "--prompt",
         default="SELECT * FROM users WHERE age > 10;",
         help="Prompt text to run inference on after training.",
@@ -385,6 +397,7 @@ def main():
     print(f"Train dir:   {args.train_dir}")
     print(f"Steps:       {args.steps}")
     print(f"LR:          {args.lr}")
+    print(f"Optimizer:   {args.optimizer}")
     print()
 
     losses_c = run_c_training(
@@ -394,6 +407,7 @@ def main():
         args.steps,
         args.lr,
         args.log_interval,
+        args.optimizer,
     )
 
     print("\n--------------------------------------------")
@@ -406,6 +420,7 @@ def main():
         args.steps,
         args.lr,
         args.log_interval,
+        args.optimizer,
     )
 
     # Merge and print side-by-side (by step)
@@ -470,4 +485,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
