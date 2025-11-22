@@ -40,3 +40,10 @@ gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
     --weights gpt2_bump.weights \
     --executable ./main
 
+  python3 unittest/validate_training_step_vs_hf.py \
+    --pair-file data/sql_training_pairs/pair_00000.bin \
+    --weights gpt2_bump.weights \
+    --executable ./main \
+    --model-name gpt2 \
+    --layer 11
+
