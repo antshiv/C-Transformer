@@ -105,6 +105,10 @@ def run_c_debug_backward(
     grad_embed_pat = re.compile(
         r"GRAD\s+embed_weight\s+idx=(\d+)\s+value=([\-0-9.eE]+)"
     )
+    # Value dumps (non-gradient) to inspect LN inputs / upstream grads
+    val_pat = re.compile(
+        r"VAL\s+(final_ln_x|final_ln_dy)\s+idx=(\d+)\s+value=([\-0-9.eE]+)"
+    )
 
     for line in result.stdout.splitlines():
         m_loss = loss_pat.search(line)
@@ -135,6 +139,14 @@ def run_c_debug_backward(
             idx = int(m_ge.group(1))
             val = float(m_ge.group(2))
             grads.setdefault("embed_weight", {})[idx] = val
+            continue
+
+        m_val = val_pat.search(line)
+        if m_val:
+            name = m_val.group(1)
+            idx = int(m_val.group(2))
+            val = float(m_val.group(3))
+            grads.setdefault(name, {})[idx] = val
             continue
 
     if loss_c is None:
@@ -195,14 +207,20 @@ def main():
     import torch
     model.zero_grad(set_to_none=True)
     input_ids = torch.tensor([token_ids], dtype=torch.long)
-    # Hook to capture grad w.r.t final LayerNorm input
+    # Hooks to capture LN_f input, grad_input, and grad_output
     hook_vals = {}
 
-    def ln_f_hook(module, grad_input, grad_output):
-        # grad_input[0] is dL/d(input), shape [1, T, D]
-        hook_vals["ln_f_grad_input"] = grad_input[0].detach().cpu()
+    def ln_f_fwd_hook(module, inputs, output):
+        # inputs[0] is LN input x, shape [1, T, D]
+        hook_vals["ln_f_input"] = inputs[0].detach().cpu()
 
-    handle = model.transformer.ln_f.register_full_backward_hook(ln_f_hook)
+    def ln_f_bwd_hook(module, grad_input, grad_output):
+        # grad_input[0] is dL/d(input), grad_output[0] is upstream dY
+        hook_vals["ln_f_grad_input"] = grad_input[0].detach().cpu()
+        hook_vals["ln_f_grad_output"] = grad_output[0].detach().cpu()
+
+    handle_fwd = model.transformer.ln_f.register_forward_hook(ln_f_fwd_hook)
+    handle_bwd = model.transformer.ln_f.register_full_backward_hook(ln_f_bwd_hook)
 
     logits = model(input_ids).logits  # [1, T, V]
     T = logits.size(1)
@@ -212,7 +230,8 @@ def main():
     loss_terms = -log_probs[0, torch.arange(T), targets[0]]  # [T]
     loss_hf = loss_terms.mean()
     loss_hf.backward()
-    handle.remove()
+    handle_fwd.remove()
+    handle_bwd.remove()
 
     print(f"\nHF loss (eval): {loss_hf.item():.9g}  |  C loss: {loss_c:.9g}")
 
@@ -280,6 +299,8 @@ def main():
     ln_f_gamma = flatten_grad(model.transformer.ln_f.weight)
     ln_f_beta = flatten_grad(model.transformer.ln_f.bias)
     ln_f_input_grad = flatten_tensor(hook_vals.get("ln_f_grad_input"))
+    ln_f_input = flatten_tensor(hook_vals.get("ln_f_input"))
+    ln_f_grad_output = flatten_tensor(hook_vals.get("ln_f_grad_output"))
 
     # Transformer block selected for per-layer comparisons
     layer_idx = args.layer
@@ -304,6 +325,8 @@ def main():
         "final_ln_gamma": ln_f_gamma,
         "final_ln_beta": ln_f_beta,
         "final_ln_input": ln_f_input_grad,
+        "final_ln_x": ln_f_input,
+        "final_ln_dy": ln_f_grad_output,
         f"ln1_gamma_{key_layer}": ln1_gamma,
         f"ln1_beta_{key_layer}": ln1_beta,
         f"ln2_gamma_{key_layer}": ln2_gamma,
@@ -358,10 +381,11 @@ def main():
                 )
 
     # Compare the slices we printed in C
-    # Compare the slices we printed in C
     compare_grad("final_ln_gamma", "final_ln_gamma")
     compare_grad("final_ln_beta", "final_ln_beta")
     compare_grad("final_ln_input", "final_ln_input")
+    compare_grad("final_ln_x", "final_ln_x")
+    compare_grad("final_ln_dy", "final_ln_dy")
     compare_grad(f"ln1_gamma_{key_layer}", f"ln1_gamma_{key_layer}")
     compare_grad(f"ln1_beta_{key_layer}", f"ln1_beta_{key_layer}")
     compare_grad(f"ln2_gamma_{key_layer}", f"ln2_gamma_{key_layer}")

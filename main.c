@@ -7843,6 +7843,21 @@ static void debug_backward_dump_grads_lm(TransformerModel *M,
         printf("GRAD final_ln_input idx=%d value=%.9g\n", i, d_final_ln_input[i]);
     }
 
+    // Also dump a slice of the forward input to final LN (x)
+    // and the upstream gradient dY entering final LN (d_final_output).
+    // These help isolate whether discrepancies come from:
+    //  - the LM head / loss (dY),
+    //  - the last layer's residual output (x),
+    //  - or the LN backward math itself.
+    float *final_ln_input = M->memory_base + M->gradients.final_ln_input_copy_offset;
+    float *d_final_output = M->memory_base + M->gradients.d_final_output_offset;
+    for (int i = 0; i < max_print_final_in; ++i) {
+        printf("VAL final_ln_x idx=%d value=%.9g\n", i, final_ln_input[i]);
+    }
+    for (int i = 0; i < max_print_final_in; ++i) {
+        printf("VAL final_ln_dy idx=%d value=%.9g\n", i, d_final_output[i]);
+    }
+
     // Layer-specific gradients (proj, MLP, LN1/LN2) as a representative layer
     if (M->num_layers > 0 && M->gradients.layers) {
         if (layer_idx < 0) layer_idx = 0;
