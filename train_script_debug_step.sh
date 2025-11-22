@@ -43,11 +43,9 @@ if [ ! -f "${WEIGHTS}" ]; then
   exit 1
 fi
 
-if [ ! -x "${EXECUTABLE}" ]; then
-  echo "⚠️  Executable '${EXECUTABLE}' not found or not executable; trying to build ./main ..."
-  gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
-  EXECUTABLE=./main
-fi
+echo "🔨 Recompiling ./main to ensure latest flags (including --debug-train-step)..."
+gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
+EXECUTABLE=./main
 
 echo "Pair file: ${PAIR_FILE}"
 echo "Weights:   ${WEIGHTS}"
@@ -81,4 +79,3 @@ echo "▶ Running single training_step debug (next-token LM)..."
 "${EXECUTABLE}" --weights "${WEIGHTS}" --force \
   --prompt "${PROMPT_TOKENS}" \
   --debug-train-step
-
