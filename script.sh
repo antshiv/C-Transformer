@@ -65,4 +65,9 @@ gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
     --prompt "SELECT * FROM users WHERE age > 10;" \
     --gen-tokens 20
 
+    python3 unittest/validate_training_step_next_token.py \
+      --pair-file data/sql_training_pairs/pair_00000.bin \
+      --weights gpt2_bump.weights \
+      --executable ./main \
+      --model-name gpt2
 
