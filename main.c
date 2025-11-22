@@ -7940,6 +7940,41 @@ static void debug_backward_dump_grads_lm(TransformerModel *M,
         for (int i = 0; i < limit_fc2; ++i) {
             printf("GRAD fc2_weight layer=%d idx=%d value=%.9g\n", layer_idx, i, d_fc2_w[i]);
         }
+
+        // ---------------------------------------------------------------------
+        // Per-stage backward gradients for this layer (last active token).
+        // These are useful to validate LN2/MLP/LN1 wiring against HF at the
+        // same granularity as the forward layer-stage checks.
+        // ---------------------------------------------------------------------
+        int t_last = ctx_len > 0 ? (ctx_len - 1) : 0;
+        if (t_last >= M->context_window) {
+            t_last = M->context_window - 1;
+        }
+
+        // LN2: d_output (incoming grad to LN2) and d_input (grad to its input)
+        float *d_ln2_out = M->memory_base + LG0->d_ln2_output_offset;
+        float *d_ln2_in  = M->memory_base + LG0->d_ln2_input_offset;
+        int max_stage = (D < 16) ? D : 16;
+        for (int d = 0; d < max_stage; ++d) {
+            float val = d_ln2_out[t_last * M->aligned_embed_dim + d];
+            printf("VAL BWD_ln2_out idx=%d value=%.9g\n", d, val);
+        }
+        for (int d = 0; d < max_stage; ++d) {
+            float val = d_ln2_in[t_last * M->aligned_embed_dim + d];
+            printf("VAL BWD_ln2_in idx=%d value=%.9g\n", d, val);
+        }
+
+        // LN1: d_output (incoming grad to LN1) and d_input (grad to its input)
+        float *d_ln1_out = M->memory_base + LG0->d_ln1_output_offset;
+        float *d_ln1_in  = M->memory_base + LG0->d_ln1_input_offset;
+        for (int d = 0; d < max_stage; ++d) {
+            float val = d_ln1_out[t_last * M->aligned_embed_dim + d];
+            printf("VAL BWD_ln1_out idx=%d value=%.9g\n", d, val);
+        }
+        for (int d = 0; d < max_stage; ++d) {
+            float val = d_ln1_in[t_last * M->aligned_embed_dim + d];
+            printf("VAL BWD_ln1_in idx=%d value=%.9g\n", d, val);
+        }
     }
 
     // Embedding / LM head weight tying gradients: print a small slice
