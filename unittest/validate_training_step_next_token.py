@@ -180,9 +180,15 @@ def main():
     model = load_model(args.model_name)
     model.zero_grad(set_to_none=True)
 
-    # HF uses [1, T] tensors
-    input_ids = torch.tensor(tokens[:ctx_len], dtype=torch.long).unsqueeze(0)
-    labels = torch.tensor(tokens[1 : ctx_len + 1], dtype=torch.long).unsqueeze(0)
+    # To match C's next-token objective:
+    #  - C uses ctx_len inputs and predicts tokens[1..ctx_len]
+    #  - HF GPT2LMHeadModel shifts logits/labels internally:
+    #       shift_logits = logits[..., :-1, :]
+    #       shift_labels = labels[..., 1:]
+    #    so with length ctx_len+1 and labels == input_ids, HF loss
+    #    is over tokens[1..ctx_len], same as C.
+    input_ids = torch.tensor(tokens[: ctx_len + 1], dtype=torch.long).unsqueeze(0)
+    labels = input_ids.clone()
 
     with torch.no_grad():
         outputs = model(input_ids=input_ids, labels=labels)
@@ -200,4 +206,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
