@@ -7811,6 +7811,25 @@ static void debug_backward_dump_grads_lm(TransformerModel *M,
     float loss = 0.0f;
     compute_cross_entropy_loss(M, target_tokens, ctx_len, &loss);
 
+    // For debugging loss / LM head, dump a small slice of d_logits
+    // before running backward_lm_head. We print the first few vocab
+    // indices for token t=0 plus the correct token id.
+    {
+        float *d_logits = M->memory_base + M->gradients.d_logits_offset;
+        int t = 0;
+        int vocab = M->vocab_size;
+        int max_v = (vocab < 10) ? vocab : 10;
+        for (int v = 0; v < max_v; ++v) {
+            float val = d_logits[t * vocab + v];
+            printf("DLOGIT t=%d v=%d value=%.9g\n", t, v, val);
+        }
+        int correct_v = target_tokens[t];
+        if (correct_v >= 0 && correct_v < vocab) {
+            float val = d_logits[t * vocab + correct_v];
+            printf("DLOGIT t=%d v=%d value=%.9g\n", t, correct_v, val);
+        }
+    }
+
     // ===== BACKWARD =====
     cache_forward_activations(M);
     backward_lm_head(M);

@@ -36,3 +36,7 @@ gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
     --weights gpt2_bump.weights \
     --executable ./main
 
+  python3 unittest/validate_lm_head_vs_c.py "Hello" \
+    --weights gpt2_bump.weights \
+    --executable ./main
+
