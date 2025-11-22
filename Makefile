@@ -14,6 +14,13 @@ PROMPT = "Hello World"
 LAYER = 0
 TOPK = 20
 
+# Training parameters
+TRAIN_DIR = data/sql_training_pairs
+TRAIN_STEPS = 10
+TRAIN_LR = 3e-5
+TRAIN_PROMPT = "SELECT * FROM users WHERE age > 10;"
+GEN_TOKENS = 20
+
 # Python interpreter
 PYTHON = python3
 
@@ -151,6 +158,29 @@ test-training-step: build
 		--layer $(LAYER)
 
 # ============================================================================
+# Training comparison targets
+# ============================================================================
+
+.PHONY: compare-training train-compare
+
+compare-training: build
+	@echo "🎓 Comparing C vs PyTorch training..."
+	@echo "   Steps: $(TRAIN_STEPS), LR: $(TRAIN_LR)"
+	@echo "   Training dir: $(TRAIN_DIR)"
+	$(PYTHON) compare_training_c_vs_pytorch.py \
+		--train-dir $(TRAIN_DIR) \
+		--weights $(WEIGHTS) \
+		--executable ./$(TARGET) \
+		--model-name gpt2 \
+		--steps $(TRAIN_STEPS) \
+		--lr $(TRAIN_LR) \
+		--log-interval 1 \
+		--prompt $(TRAIN_PROMPT) \
+		--gen-tokens $(GEN_TOKENS)
+
+train-compare: compare-training
+
+# ============================================================================
 # Quick validation shortcuts
 # ============================================================================
 
@@ -225,6 +255,10 @@ help:
 	@echo "  make validate-backward         - Check gradients"
 	@echo "  make validate-backward-stages  - Check layer gradients"
 	@echo ""
+	@echo "Training:"
+	@echo "  make compare-training   - Compare C vs PyTorch training"
+	@echo "  make train-compare      - Alias for compare-training"
+	@echo ""
 	@echo "Test suites:"
 	@echo "  make quick-test         - Quick smoke test"
 	@echo "  make forward            - Full forward validation"
@@ -236,10 +270,16 @@ help:
 	@echo "  PROMPT=<text>           - Test prompt (default: \"Hello World\")"
 	@echo "  LAYER=<n>               - Layer to test (default: 0)"
 	@echo "  TOPK=<n>                - Top-K for logits (default: 20)"
+	@echo "  TRAIN_DIR=<dir>         - Training data dir (default: data/sql_training_pairs)"
+	@echo "  TRAIN_STEPS=<n>         - Training steps (default: 10)"
+	@echo "  TRAIN_LR=<float>        - Learning rate (default: 3e-5)"
+	@echo "  TRAIN_PROMPT=<text>     - Prompt for inference test (default: SQL query)"
+	@echo "  GEN_TOKENS=<n>          - Tokens to generate (default: 20)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build"
 	@echo "  make validate-all PROMPT=\"Once upon a time\" LAYER=5"
 	@echo "  make validate-backward LAYER=11"
+	@echo "  make compare-training TRAIN_STEPS=20 TRAIN_LR=5e-5"
 	@echo "  make full-test"
 
