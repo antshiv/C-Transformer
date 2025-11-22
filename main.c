@@ -7120,31 +7120,42 @@ void backward_lm_head(TransformerModel *M) {
     // 
     // dL/d_final_ln_output[t,d] = sum_v (dL/dlogits[t,v] * lm_head_weights[v,d])
     // dL/d_lm_head_weights[v,d] = sum_t (dL/dlogits[t,v] * final_ln_output[t,d])
+    //
+    // NOTE:
+    // The original AVX-512 implementation mixed vocabulary and embedding
+    // dimensions incorrectly (vectorizing across both), which produced
+    // large numerical discrepancies in d_final_ln_output even though
+    // d_logits and lm_head_weights were correct. Here we use a clear
+    // triple loop that matches the reference Python implementation
+    // exactly; it can be re-vectorized safely once correctness is
+    // fully validated.
     // ============================================================================
+    
+    int T = (M->active_tokens > 0 && M->active_tokens <= M->context_window)
+                ? M->active_tokens
+                : M->context_window;
+    int V = M->vocab_size;
+    int D = M->embed_dim;
+    int aligned_D = M->aligned_embed_dim;
     
     // 1. Compute gradient w.r.t final layernorm output
     #pragma omp parallel for collapse(2) num_threads(M->num_cores)
-    for (int t = 0; t < M->context_window; t++) {
-        for (int d = 0; d < M->embed_dim; d++) {
+    for (int t = 0; t < T; t++) {
+        for (int d = 0; d < D; d++) {
             float grad_sum = 0.0f;
-            
-            // Vectorized accumulation over vocabulary
-            int v;
-            __m512 sum_vec = _mm512_setzero_ps();
-            for (v = 0; v <= M->vocab_size - 16; v += 16) {
-                __m512 d_logit_vec = _mm512_loadu_ps(&d_logits[t * M->vocab_size + v]);
-                __m512 weight_vec = _mm512_loadu_ps(&lm_head_weights[v * M->aligned_embed_dim + d]);
-                sum_vec = _mm512_fmadd_ps(d_logit_vec, weight_vec, sum_vec);
+            for (int v = 0; v < V; v++) {
+                float dlogit = d_logits[t * V + v];
+                float w = lm_head_weights[v * aligned_D + d];
+                grad_sum += dlogit * w;
             }
-            grad_sum = _mm512_reduce_add_ps(sum_vec);
-            
-            // Handle remainder
-            for (; v < M->vocab_size; v++) {
-                grad_sum += d_logits[t * M->vocab_size + v] * 
-                           lm_head_weights[v * M->aligned_embed_dim + d];
-            }
-            
-            d_final_ln_output[t * M->aligned_embed_dim + d] = grad_sum;
+            d_final_ln_output[t * aligned_D + d] = grad_sum;
+        }
+    }
+    // Zero out padded tokens beyond T to avoid polluting later reductions
+    for (int t = T; t < M->context_window; ++t) {
+        float *row = d_final_ln_output + t * aligned_D;
+        for (int d = 0; d < aligned_D; ++d) {
+            row[d] = 0.0f;
         }
     }
     
