@@ -1,0 +1,245 @@
+# C-Transformer Makefile
+# Provides convenient shortcuts for building, testing, and validating
+
+# Compiler settings
+CC = gcc
+CFLAGS = -O3 -march=native -mavx512f -fopenmp
+LDFLAGS = -lm
+TARGET = main
+SOURCE = main.c
+
+# Default weights file
+WEIGHTS = gpt2_bump.weights
+PROMPT = "Hello World"
+LAYER = 0
+TOPK = 20
+
+# Python interpreter
+PYTHON = python3
+
+# ============================================================================
+# Build targets
+# ============================================================================
+
+.PHONY: all build clean help
+
+all: build
+
+build:
+	@echo "🔨 Compiling $(SOURCE)..."
+	$(CC) $(CFLAGS) $(SOURCE) -o $(TARGET) $(LDFLAGS)
+	@echo "✅ Build complete: ./$(TARGET)"
+
+clean:
+	@echo "🧹 Cleaning build artifacts..."
+	rm -f $(TARGET)
+	rm -f validation_*.csv
+	@echo "✅ Clean complete"
+
+# ============================================================================
+# Quick test targets
+# ============================================================================
+
+.PHONY: run test-gpt2 test-large
+
+run: build
+	@echo "🚀 Running GPT-2 inference..."
+	./$(TARGET) --weights $(WEIGHTS) --force
+
+test-gpt2: build
+	@echo "🧪 Testing GPT-2 with custom prompt..."
+	./$(TARGET) --weights $(WEIGHTS) --prompt "2061,318,649,27288,362,358,1099,30" --force
+
+test-large:
+	@echo "🧪 Testing large model configuration..."
+	./$(TARGET) --layers 96 --dmodel 8192 --ctx 4096 --vocab 50000 --force
+
+benchmark: build
+	@echo "⚡ Running benchmark..."
+	./$(TARGET) --layers 96 --dmodel 8192 --ctx 4096 --vocab 50000 --force --benchmark
+
+# ============================================================================
+# Validation targets (Forward Pass)
+# ============================================================================
+
+.PHONY: validate validate-all validate-weights validate-embed validate-layers validate-qkv validate-attn
+
+validate: validate-all
+
+validate-all: build
+	@echo "🧪 Running full validation pipeline..."
+	./validate_all.sh $(PROMPT) $(WEIGHTS) ./$(TARGET) $(TOPK) $(LAYER)
+
+validate-weights:
+	@echo "🔍 Validating weight loading..."
+	$(PYTHON) validate_weights.py
+
+validate-embed: build
+	@echo "🔍 Validating embeddings..."
+	$(PYTHON) validate_embeddings.py $(PROMPT) --weights $(WEIGHTS) --executable ./$(TARGET)
+
+validate-layers: build
+	@echo "🔍 Validating layer stages (layer $(LAYER))..."
+	$(PYTHON) validate_layer_stages.py $(PROMPT) \
+		--layer $(LAYER) \
+		--weights $(WEIGHTS) \
+		--executable ./$(TARGET)
+
+validate-qkv: build
+	@echo "🔍 Validating QKV projection (layer $(LAYER))..."
+	$(PYTHON) validate_qkv.py $(PROMPT) \
+		--layer $(LAYER) \
+		--weights $(WEIGHTS) \
+		--executable ./$(TARGET)
+
+validate-attn: build
+	@echo "🔍 Validating attention (layer $(LAYER))..."
+	$(PYTHON) validate_attn.py $(PROMPT) \
+		--layer $(LAYER) \
+		--weights $(WEIGHTS) \
+		--executable ./$(TARGET)
+
+validate-logits: build
+	@echo "🔍 Validating logits..."
+	$(PYTHON) validate_vs_pytorch.py $(PROMPT) \
+		--weights $(WEIGHTS) \
+		--executable ./$(TARGET) \
+		--top-k $(TOPK) \
+		--compare-hidden
+
+# ============================================================================
+# Validation targets (Backward Pass)
+# ============================================================================
+
+.PHONY: validate-backward validate-backward-stages validate-gradients
+
+validate-backward: build
+	@echo "🔍 Validating backward pass..."
+	$(PYTHON) validate_backward.py $(PROMPT) \
+		--weights $(WEIGHTS) \
+		--executable ./$(TARGET)
+
+validate-backward-stages: build
+	@echo "🔍 Validating backward layer stages (layer $(LAYER))..."
+	$(PYTHON) unittest/validate_backward_layer_stages.py $(PROMPT) \
+		--weights $(WEIGHTS) \
+		--executable ./$(TARGET) \
+		--model-name gpt2 \
+		--layer $(LAYER)
+
+validate-gradients: validate-backward
+
+# ============================================================================
+# Unit test targets
+# ============================================================================
+
+.PHONY: test-lm-head test-training-step
+
+test-lm-head: build
+	@echo "🧪 Testing LM head..."
+	$(PYTHON) unittest/validate_lm_head_vs_c.py "Hello" \
+		--weights $(WEIGHTS) \
+		--executable ./$(TARGET)
+
+test-training-step: build
+	@echo "🧪 Testing training step (layer $(LAYER))..."
+	$(PYTHON) unittest/validate_training_step_vs_hf.py \
+		--pair-file data/sql_training_pairs/pair_00000.bin \
+		--weights $(WEIGHTS) \
+		--executable ./$(TARGET) \
+		--model-name gpt2 \
+		--layer $(LAYER)
+
+# ============================================================================
+# Quick validation shortcuts
+# ============================================================================
+
+.PHONY: quick-test full-test forward backward
+
+# Quick smoke test - just check if basics work
+quick-test: build validate-weights validate-embed validate-qkv
+	@echo "✅ Quick test complete!"
+
+# Full forward pass validation
+forward: build validate-all
+	@echo "✅ Forward pass validation complete!"
+
+# Full backward pass validation
+backward: build validate-backward validate-backward-stages
+	@echo "✅ Backward pass validation complete!"
+
+# Complete test suite (forward + backward)
+full-test: forward backward
+	@echo "✅ Full test suite complete!"
+
+# ============================================================================
+# Development helpers
+# ============================================================================
+
+.PHONY: rebuild debug watch
+
+# Force rebuild
+rebuild: clean build
+
+# Build with debug symbols
+debug:
+	@echo "🔨 Compiling with debug symbols..."
+	$(CC) -g -O0 -march=native -mavx512f -fopenmp $(SOURCE) -o $(TARGET) $(LDFLAGS)
+
+# Watch for changes and rebuild (requires inotify-tools)
+watch:
+	@echo "👀 Watching for changes..."
+	@while true; do \
+		inotifywait -e modify $(SOURCE) 2>/dev/null && make build; \
+	done
+
+# ============================================================================
+# Help
+# ============================================================================
+
+help:
+	@echo "C-Transformer Makefile"
+	@echo "====================="
+	@echo ""
+	@echo "Build targets:"
+	@echo "  make build              - Compile main.c (default)"
+	@echo "  make clean              - Remove build artifacts"
+	@echo "  make rebuild            - Clean + build"
+	@echo "  make debug              - Build with debug symbols"
+	@echo ""
+	@echo "Quick tests:"
+	@echo "  make run                - Run GPT-2 inference"
+	@echo "  make test-gpt2          - Test with encoded prompt"
+	@echo "  make benchmark          - Run performance benchmark"
+	@echo ""
+	@echo "Validation (Forward):"
+	@echo "  make validate-all       - Full validation pipeline"
+	@echo "  make validate-weights   - Check weight loading"
+	@echo "  make validate-embed     - Check embeddings"
+	@echo "  make validate-layers    - Check layer stages"
+	@echo "  make validate-qkv       - Check QKV projection"
+	@echo "  make validate-attn      - Check attention"
+	@echo "  make validate-logits    - Check final logits"
+	@echo ""
+	@echo "Validation (Backward):"
+	@echo "  make validate-backward         - Check gradients"
+	@echo "  make validate-backward-stages  - Check layer gradients"
+	@echo ""
+	@echo "Test suites:"
+	@echo "  make quick-test         - Quick smoke test"
+	@echo "  make forward            - Full forward validation"
+	@echo "  make backward           - Full backward validation"
+	@echo "  make full-test          - Complete test suite"
+	@echo ""
+	@echo "Options (set as VARIABLE=value):"
+	@echo "  WEIGHTS=<file>          - Weight file (default: gpt2_bump.weights)"
+	@echo "  PROMPT=<text>           - Test prompt (default: \"Hello World\")"
+	@echo "  LAYER=<n>               - Layer to test (default: 0)"
+	@echo "  TOPK=<n>                - Top-K for logits (default: 20)"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make build"
+	@echo "  make validate-all PROMPT=\"Once upon a time\" LAYER=5"
+	@echo "  make validate-backward LAYER=11"
+	@echo "  make full-test"
+

@@ -54,3 +54,15 @@ gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
     --model-name gpt2 \
     --layer 11
 
+  python3 compare_training_c_vs_pytorch.py \
+    --train-dir data/sql_training_pairs \
+    --weights gpt2_bump.weights \
+    --executable ./main \
+    --model-name gpt2 \
+    --steps 10 \
+    --lr 3e-5 \
+    --log-interval 1 \
+    --prompt "SELECT * FROM users WHERE age > 10;" \
+    --gen-tokens 20
+
+
