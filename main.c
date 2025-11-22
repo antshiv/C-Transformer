@@ -8921,6 +8921,7 @@ int main(int argc, char **argv)
     int debug_embed = 0;
     int debug_layer = -1;
     int debug_backward = 0;
+    int debug_train_step = 0;
     int debug_top_k = 10;
 
 #define CLEANUP_AND_RETURN(code)                     \
@@ -8966,6 +8967,7 @@ int main(int argc, char **argv)
         {"debug-embed", no_argument, 0, 1021},
         {"debug-layer", required_argument, 0, 1022},
         {"debug-backward", no_argument, 0, 1023},
+        {"debug-train-step", no_argument, 0, 1024},
         {0, 0, 0, 0}
     };
 
@@ -9088,6 +9090,9 @@ int main(int argc, char **argv)
         case 1023:
             debug_backward = 1;
             break;
+        case 1024:
+            debug_train_step = 1;
+            break;
         default:
             fprintf(stderr, "Usage: %s [--layers N] [--dmodel N] [--ctx N] [--vocab N] [--head-dim N] [--force] [--benchmark] [--weights FILE] [--prompt TOKENS] [--train-dir DIR] [--train-steps N] [--train-lr LR] [--train-log-interval N] [--ckpt-dir DIR] [--ckpt-interval N] [--train-cache-samples N] [--seq-cls-classes N] [--seq-cls-pooling final|cls|mean] [--optimizer sgd|adam] [--adam-beta1 X] [--adam-beta2 X] [--adam-eps X] [--weight-decay X] [--ema-decay X] [--lr-warmup-steps N] [--lr-warmup-init LR] [--grad-clip X] [--debug-logits] [--debug-top-k N] [--debug-hidden] [--debug-embed] [--debug-layer L]\n", argv[0]);
             CLEANUP_AND_RETURN(1);
@@ -9198,7 +9203,7 @@ int main(int argc, char **argv)
         printf("📚 Training dataset: %zu windows (caching %zu inside arena)\n",
                dataset_pairs, cache_samples);
         M.kv_cache_enabled = false;
-    } else if (debug_backward) {
+    } else if (debug_backward || debug_train_step) {
         // Enable gradient storage even when not running the full training loop.
         // This allows a one-off forward+backward step for numerical validation.
         M.training_enabled = true;
@@ -9346,6 +9351,30 @@ int main(int argc, char **argv)
                 int default_prompt[] = {15496, 11, 314, 716}; // "Hello, I am"
                 printf("⚠️  No prompt provided, using default: \"Hello, I am\" for debug embed\n");
                 debug_forward_dump_embed(&M, default_prompt, 4);
+            }
+        } else if (debug_train_step) {
+            printf("\n🧪 Debug mode: single training_step (next-token LM)\n");
+            if (!M.training_enabled) {
+                printf("❌ Training buffers not allocated; enable training mode for debug-train-step.\n");
+            } else if (prompt_length > 1) {
+                int ctx_len = prompt_length - 1;
+                if (ctx_len > 1024) {
+                    ctx_len = 1024;
+                }
+                int32_t input_tokens[1024];
+                int32_t target_tokens[1024];
+                memset(input_tokens, 0, sizeof(input_tokens));
+                memset(target_tokens, 0, sizeof(target_tokens));
+                for (int i = 0; i < ctx_len; ++i) {
+                    input_tokens[i] = prompt_tokens[i];
+                    target_tokens[i] = prompt_tokens[i + 1];
+                }
+                // Use LM task; seq_label unused for LM.
+                M.task_type = TASK_LM;
+                float loss = training_step(&M, input_tokens, target_tokens, 0, ctx_len, 0.0f);
+                printf("DEBUG_TRAINSTEP loss=%.9g\n", loss);
+            } else {
+                printf("❌ Need at least 2 prompt tokens for next-token LM debug.\n");
             }
         } else if (debug_backward) {
             printf("\n🧪 Debug mode: backward LM gradient dump\n");
