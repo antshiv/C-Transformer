@@ -47,3 +47,10 @@ gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
     --model-name gpt2 \
     --layer 11
 
+  python3 unittest/validate_backward_layer_stages.py \
+    "Hello World" \
+    --weights gpt2_bump.weights \
+    --executable ./main \
+    --model-name gpt2 \
+    --layer 11
+
