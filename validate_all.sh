@@ -40,24 +40,24 @@ echo "Layer:       $LAYER"
 echo
 
 echo "1) Checking raw weights (export/layout)..."
-python3 debug_weights.py
+python3 validation/debug_weights.py
 echo
 
 echo "2) Validating embeddings (token + position)..."
-python3 validate_embeddings.py "$PROMPT" \
+python3 validation/validate_embeddings.py "$PROMPT" \
   --weights "$WEIGHTS" \
   --executable "$EXECUTABLE"
 echo
 
 echo "3) Validating layer output (layer index: $LAYER)..."
-python3 validate_layers.py "$PROMPT" \
+python3 validation/validate_layers.py "$PROMPT" \
   --weights "$WEIGHTS" \
   --executable "$EXECUTABLE" \
   --layer "$LAYER"
 echo
 
 echo "4) Validating final hidden state + logits..."
-./validate_inference.sh "$PROMPT" "$WEIGHTS" "$EXECUTABLE" "$TOP_K"
+./scripts/validate_inference.sh "$PROMPT" "$WEIGHTS" "$EXECUTABLE" "$TOP_K"
 echo
 
 echo "✅ Validation pipeline complete."

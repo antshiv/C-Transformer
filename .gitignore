@@ -8,6 +8,7 @@ docs/rtf/
 docs/xml/
 tmp/
 main
+Screenshots/
 # Keep these files (they're source, not generated):
 # docs/*.md
 # Doxyfile

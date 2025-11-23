@@ -113,6 +113,17 @@ def main():
         default=10,
         help="Log every N steps (default: 10)",
     )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=50,
+        help="Save checkpoint every N steps (default: 50)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="checkpoints/sql_gpt2",
+        help="Directory to save checkpoints (default: checkpoints/sql_gpt2)",
+    )
     args = parser.parse_args()
 
     if not os.path.isdir(args.train_dir):
@@ -127,13 +138,18 @@ def main():
     print("============================================")
     print("PyTorch GPT-2 Training on SQL Windows")
     print("============================================")
-    print(f"Train dir:   {args.train_dir}")
-    print(f"Model name:  {args.model_name}")
-    print(f"Steps:       {args.steps}")
-    print(f"LR:          {args.lr}")
+    print(f"Train dir:        {args.train_dir}")
+    print(f"Model name:       {args.model_name}")
+    print(f"Steps:            {args.steps}")
+    print(f"LR:               {args.lr}")
+    print(f"Checkpoint every: {args.checkpoint_interval} steps")
+    print(f"Output dir:       {args.output_dir}")
     print()
 
-    model, _ = load_model_and_tokenizer(args.model_name)
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    model, tokenizer = load_model_and_tokenizer(args.model_name)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     step = 0
@@ -165,6 +181,47 @@ def main():
                 f"perplexity={ppl:.2f}  sample={os.path.basename(path)}"
             )
 
+        # Save checkpoint at intervals
+        if step % args.checkpoint_interval == 0:
+            checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{step}")
+            print(f"\n💾 Saving checkpoint at step {step}...")
+            model.save_pretrained(checkpoint_dir)
+            tokenizer.save_pretrained(checkpoint_dir)
+
+            # Save training metadata
+            import json
+            metadata = {
+                "step": step,
+                "loss": loss.item(),
+                "learning_rate": args.lr,
+                "training_data": args.train_dir,
+                "num_files": len(pair_files),
+                "model_name": args.model_name
+            }
+            with open(os.path.join(checkpoint_dir, "training_info.json"), 'w') as f:
+                json.dump(metadata, f, indent=2)
+            print(f"✅ Checkpoint saved to {checkpoint_dir}\n")
+
+    # Save final checkpoint
+    final_dir = os.path.join(args.output_dir, "final")
+    print(f"\n💾 Saving final model...")
+    model.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
+
+    import json
+    final_metadata = {
+        "step": step,
+        "final_loss": loss.item(),
+        "total_steps": args.steps,
+        "learning_rate": args.lr,
+        "training_data": args.train_dir,
+        "num_files": len(pair_files),
+        "model_name": args.model_name
+    }
+    with open(os.path.join(final_dir, "training_info.json"), 'w') as f:
+        json.dump(final_metadata, f, indent=2)
+
+    print(f"✅ Final model saved to {final_dir}")
     print("✅ PyTorch training loop complete.")
 
 

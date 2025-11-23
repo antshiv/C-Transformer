@@ -11,28 +11,28 @@ gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
  gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
  ./main --weights gpt2_bump.weights --force
 
- python3 run.py "What is the capital of France?"
- python encode.py "What is newtons 2nd law?"
+ python3 utils/run.py "What is the capital of France?"
+ python3 utils/encode.py "What is newtons 2nd law?"
  ./main --weights gpt2_bump.weights --prompt "2061,318,649,27288,362,358,1099,30" --force
 
 ./validate_all.sh "Hello World" gpt2_bump.weights ./main 20 0
 
-  python3 validate_layer_stages.py "Hello World" \
+  python3 validation/validate_layer_stages.py "Hello World" \
     --layer 0 \
     --weights gpt2_bump.weights \
     --executable ./main
 
-  python3 validate_qkv.py "Hello World" \
+  python3 validation/validate_qkv.py "Hello World" \
     --layer 0 \
     --weights gpt2_bump.weights \
     --executable ./main
 
-  python3 validate_attn.py "Hello World" \
+  python3 validation/validate_attn.py "Hello World" \
     --layer 0 \
     --weights gpt2_bump.weights \
     --executable ./main
 
-  python3 validate_backward.py "Hello World" \
+  python3 validation/validate_backward.py "Hello World" \
     --weights gpt2_bump.weights \
     --executable ./main
 
@@ -54,7 +54,7 @@ gcc -O3 -march=native -mavx512f -fopenmp main.c -o main -lm
     --model-name gpt2 \
     --layer 11
 
-  python3 compare_training_c_vs_pytorch.py \
+  python3 validation/compare_training_c_vs_pytorch.py \
     --train-dir data/sql_training_pairs \
     --weights gpt2_bump.weights \
     --executable ./main \

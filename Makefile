@@ -80,36 +80,36 @@ validate-all: build
 
 validate-weights:
 	@echo "🔍 Validating weight loading..."
-	$(PYTHON) validate_weights.py
+	$(PYTHON) validation/validate_weights.py
 
 validate-embed: build
 	@echo "🔍 Validating embeddings..."
-	$(PYTHON) validate_embeddings.py $(PROMPT) --weights $(WEIGHTS) --executable ./$(TARGET)
+	$(PYTHON) validation/validate_embeddings.py $(PROMPT) --weights $(WEIGHTS) --executable ./$(TARGET)
 
 validate-layers: build
 	@echo "🔍 Validating layer stages (layer $(LAYER))..."
-	$(PYTHON) validate_layer_stages.py $(PROMPT) \
+	$(PYTHON) validation/validate_layer_stages.py $(PROMPT) \
 		--layer $(LAYER) \
 		--weights $(WEIGHTS) \
 		--executable ./$(TARGET)
 
 validate-qkv: build
 	@echo "🔍 Validating QKV projection (layer $(LAYER))..."
-	$(PYTHON) validate_qkv.py $(PROMPT) \
+	$(PYTHON) validation/validate_qkv.py $(PROMPT) \
 		--layer $(LAYER) \
 		--weights $(WEIGHTS) \
 		--executable ./$(TARGET)
 
 validate-attn: build
 	@echo "🔍 Validating attention (layer $(LAYER))..."
-	$(PYTHON) validate_attn.py $(PROMPT) \
+	$(PYTHON) validation/validate_attn.py $(PROMPT) \
 		--layer $(LAYER) \
 		--weights $(WEIGHTS) \
 		--executable ./$(TARGET)
 
 validate-logits: build
 	@echo "🔍 Validating logits..."
-	$(PYTHON) validate_vs_pytorch.py $(PROMPT) \
+	$(PYTHON) validation/validate_vs_pytorch.py $(PROMPT) \
 		--weights $(WEIGHTS) \
 		--executable ./$(TARGET) \
 		--top-k $(TOPK) \
@@ -123,7 +123,7 @@ validate-logits: build
 
 validate-backward: build
 	@echo "🔍 Validating backward pass..."
-	$(PYTHON) validate_backward.py $(PROMPT) \
+	$(PYTHON) validation/validate_backward.py $(PROMPT) \
 		--weights $(WEIGHTS) \
 		--executable ./$(TARGET)
 
@@ -168,7 +168,7 @@ compare-training: build
 	@echo "🎓 Comparing C vs PyTorch training..."
 	@echo "   Steps: $(TRAIN_STEPS), LR: $(TRAIN_LR), Optimizer: $(TRAIN_OPTIMIZER)"
 	@echo "   Training dir: $(TRAIN_DIR)"
-	$(PYTHON) compare_training_c_vs_pytorch.py \
+	$(PYTHON) validation/compare_training_c_vs_pytorch.py \
 		--train-dir $(TRAIN_DIR) \
 		--weights $(WEIGHTS) \
 		--executable ./$(TARGET) \
@@ -181,6 +181,51 @@ compare-training: build
 		--gen-tokens $(GEN_TOKENS)
 
 train-compare: compare-training
+
+# ============================================================================
+# PyTorch Training + Export to C
+# ============================================================================
+
+.PHONY: train-pytorch export-checkpoint test-sql
+
+# Train GPT-2 on SQL data using PyTorch
+train-pytorch:
+	@echo "🎓 Training GPT-2 on SQL data (PyTorch)..."
+	@echo "   Steps: $(TRAIN_STEPS), LR: $(TRAIN_LR)"
+	@echo "   Training dir: $(TRAIN_DIR)"
+	@echo "   Checkpoints: every 50 steps"
+	$(PYTHON) train_script_pytorch_sql.py \
+		--train-dir $(TRAIN_DIR) \
+		--steps $(TRAIN_STEPS) \
+		--lr $(TRAIN_LR) \
+		--log-interval 10 \
+		--checkpoint-interval 50 \
+		--output-dir checkpoints/sql_gpt2
+
+# Export a checkpoint to C-compatible weights
+# Usage: make export-checkpoint CHECKPOINT=checkpoints/sql_gpt2/checkpoint-50 OUTPUT=sql_step50.weights
+CHECKPOINT ?= checkpoints/sql_gpt2/final
+OUTPUT ?= sql_finetuned.weights
+
+export-checkpoint:
+	@echo "📦 Exporting checkpoint to C weights..."
+	@echo "   Checkpoint: $(CHECKPOINT)"
+	@echo "   Output:     $(OUTPUT)"
+	$(PYTHON) export_checkpoint_to_c.py \
+		--checkpoint $(CHECKPOINT) \
+		--output $(OUTPUT)
+
+# Test SQL model with C inference
+test-sql: build
+	@echo "🧪 Testing SQL fine-tuned model..."
+	@if [ ! -f "$(OUTPUT)" ]; then \
+		echo "❌ Weights file not found: $(OUTPUT)"; \
+		echo "   Run 'make train-pytorch' first, then 'make export-checkpoint'"; \
+		exit 1; \
+	fi
+	./$(TARGET) --weights $(OUTPUT) \
+		--prompt "[TASK: SQL] Question: What is the average age of users?" \
+		--force
 
 # ============================================================================
 # Quick validation shortcuts
@@ -260,6 +305,9 @@ help:
 	@echo "Training:"
 	@echo "  make compare-training   - Compare C vs PyTorch training"
 	@echo "  make train-compare      - Alias for compare-training"
+	@echo "  make train-pytorch      - Train GPT-2 on SQL data (PyTorch only)"
+	@echo "  make export-checkpoint  - Export checkpoint to C weights"
+	@echo "  make test-sql           - Test SQL fine-tuned model with C"
 	@echo ""
 	@echo "Test suites:"
 	@echo "  make quick-test         - Quick smoke test"

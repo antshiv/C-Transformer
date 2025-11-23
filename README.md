@@ -2,6 +2,38 @@
   <img src="assets/c-ttransformer.png" alt="C-Transformer Logo" width="400"/>
 </div>
 
+# ⚠️ REPOSITORY WILL BE ARCHIVED SOON
+
+**Status as of November 2025:**
+- ✅ **Inference working perfectly** - Forward pass validated against PyTorch (diff < 1e-5)
+- ⚠️ **Training has bugs** - Loss collapses to 0.0 after first step
+- 📚 **Learning phase complete** - 10 weeks of deep transformer implementation experience
+- 🔄 **Moving to next iteration** - Kernel-based DSL approach
+
+**Why archiving:**
+The codebase has become too complex (~15k lines monolithic) to efficiently debug remaining training issues. The inference engine works beautifully, but the right approach is to start fresh with lessons learned rather than debug bloated legacy code.
+
+**What's next:**
+A new repository with **kernel-level composition design** (similar to PyTorch/JAX) focusing on:
+- 🧩 Modular kernels (each kernel = forward + backward in one file)
+- 🎯 DSL-based computation graphs (not manual memory management)
+- 💻 CPU-first optimization (x86, ARM, embedded systems)
+- 🔍 Component-by-component validation (validate before moving forward)
+- 🏗️ Multi-architecture support (GPT, Qwen, LLaMA from same kernels)
+
+**Lessons learned** (documented in [`ARCHIVE_NOTICE.md`](ARCHIVE_NOTICE.md)):
+1. Don't build everything before validating - validate each component immediately
+2. Implement forward + backward together for each component, not all forward then all backward
+3. PyTorch for training + C for inference is pragmatic for this repository. 
+4. Numerical validation infrastructure is critical
+
+**If you want to use this repository:**
+- The **inference engine works perfectly** - see [`QUICKSTART_SQL_TRAINING.md`](QUICKSTART_SQL_TRAINING.md)
+- Train models in PyTorch, export weights, run inference in optimized C
+- See [`PYTORCH_TRAINING.md`](PYTORCH_TRAINING.md) for complete workflow
+
+---
+
 # 🚀 C-Transformers: Cache-Optimized Transformers in C
 
 Building Embedded AI from Scratch — in C, on CPUs (x86 optimized), for Real-Time Autonomy.
@@ -130,9 +162,26 @@ for (size_t t = 0; t < token_count; ++t) {
 
 This code is explained in detail in these video:
 
-🎥 [The Memory Trick That Makes Multi-Core CPUs Fly for AI](https://youtu.be/Wv0_GLbODeI?si=z0pMmCuD_CjLE_Ao)  
+🎥 [The Memory Trick That Makes Multi-Core CPUs Fly for AI](https://youtu.be/Wv0_GLbODeI?si=z0pMmCuD_CjLE_Ao)
    [Advanced Memory Strategies for High-Performance AI Compute](https://youtu.be/pEhcvMRWhhU?si=uJ7HsiSAMCtQyxHG)
 🧠 Covers false sharing, layout design, and core-sliced access
+
+---
+
+## 🔜 Next Generation Project
+
+This repository will soon be archived. The next iteration with kernel-based DSL design will be at:
+
+**[C-Kernel-Engine](https://github.com/antshiv/c-kernel-engine)** *(coming soon)*
+
+Focus areas:
+- 🧩 Modular kernel composition (like PyTorch/JAX)
+- 🎯 DSL-based computation graphs
+- 💻 CPU-first: x86, ARM, RISC-V, embedded systems
+- 🔧 Multi-model support: GPT, Qwen, LLaMA
+- 📊 Built-in profiling and debugging tools
+
+See [`ARCHIVE_NOTICE.md`](ARCHIVE_NOTICE.md) for the full story and [`NEXT_STEPS.md`](NEXT_STEPS.md) for the roadmap.
 
 ---
 © 2025 Antshiv Robotics. All rights reserved.
